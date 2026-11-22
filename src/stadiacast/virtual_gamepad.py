@@ -289,7 +289,7 @@ class VirtualGamepads:
                 f"--gamepad vigem needs the ViGEmBus driver installed (vgamepad said: {e}); "
                 "get it from https://github.com/nefarius/ViGEmBus/releases"
             ) from e
-        return cls(cfg, log, rx, ViGEmPad)
+        return cls(cfg, log, rx, ViGEmPad, per_boot=True)
 
     # ---- input -----------------------------------------------------------------------
     def on_event(self, ev: dict[str, Any]) -> None:
