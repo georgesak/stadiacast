@@ -91,8 +91,8 @@ class Config:
     mic_pcm: bool = False  # with mic_record: each recording decoded to s16le PCM as well, with ffmpeg
 
     # -- virtual gamepad (the input as a pad on this PC) -----------------------------------
-    # off | vigem (Windows) | ojd (macOS) | uinput (Linux, Xbox 360 pad) | uhid (Linux, Stadia Controller);
-    # implies StartGame for rumble
+    # off | vigem (Windows) | ojd (macOS) | uinput (Linux, Xbox 360 pad) | uhid (Linux, Stadia Controller) |
+    # dualsense (Linux, DualSense with per-controller MAC); implies StartGame for rumble
     gamepad: str = "off"
     gamepad_deadzone: bool = True  # apply XInput's stick deadzones (False: raw sticks)
     gamepad_profile: str = "game-controller-compatible"  # OJD: game-controller-compatible | sdl-compatible | generic

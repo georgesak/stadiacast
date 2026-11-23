@@ -352,11 +352,11 @@ them under `gamepads` with their event device.
 ### Virtual Stadia Controller (Linux)
 
 `--gamepad uhid` makes each controller a wired Stadia Controller instead, through the kernel's
-uhid device: a HID device with that controller's USB ids (`18d1:9400`), its name and its
-reports, which programs take for the controller on its cable. Steam lists a Stadia Controller
-with its **Assistant** and **Capture** buttons, which an Xbox pad has no place for, and so do
-programs built on SDL 3. SDL 2 games, browsers and the rest read it with the mapping they keep
-for that controller, where the two are spare buttons at most.
+uhid device: a HID device with that controller's USB ids (`18d1:9400`), its name, its serial in
+`HID_UNIQ` and its reports, which programs take for the controller on its cable. Steam lists a
+Stadia Controller with its **Assistant** and **Capture** buttons, which an Xbox pad has no place
+for, and so do programs built on SDL 3. SDL 2 games, browsers and the rest read it with the
+mapping they keep for that controller, where the two are spare buttons at most.
 
 ```sh
 stadiacast --preset live --dns-upstream 192.168.1.1 --gamepad uhid --gamepad-deadzone off
@@ -383,7 +383,28 @@ programs do.
 A game's rumble comes back to the controller both ways: written to the `hidraw` node, or
 played on the event device as force feedback, which takes the kernel's Stadia driver
 (`hid-google-stadiaff`, in Linux 6.6 and later). `/_status` lists each pad's `hidraw` node as
-its `device`.
+its `device` and its serial as `uniq`.
+
+### Virtual DualSense controller (Linux)
+
+On Linux and SteamOS with more than one controller, Steam's `sdl://` wrapper currently ignores
+`HID_UNIQ` for Stadia and Xbox pads and assigns controller profiles by wake order. `--gamepad
+dualsense` presents each controller through `/dev/uhid` as a USB Sony DualSense (`054c:0ce6`)
+whose pairing feature report (`0x09`) carries a deterministic locally-administered MAC derived
+from the controller's serial. Steam drives a DualSense with its own HIDAPI driver and keys each
+profile (`configset_DS<mac>.vdf`) to that MAC, so each physical controller keeps its name,
+calibration and bindings whatever order they wake in:
+
+```sh
+stadiacast --preset live --dns-upstream 192.168.1.1 --gamepad dualsense --gamepad-deadzone off
+```
+
+A/B/X/Y map to Cross/Circle/Square/Triangle, Options (`⋯`) to Create, Menu (`≡`) to Options,
+the Stadia button to PS, **Capture** to Mic Mute and **Assistant** to Touchpad click; the
+controller's battery gauge is reported and rumble comes back through USB output report `0x02`.
+SteamOS and `steam-devices` already grant access to DualSense `hidraw` nodes, so there only the
+`/dev/uhid` rule above is needed; on a desktop without Steam's rules, add
+`KERNEL=="hidraw*", SUBSYSTEM=="hidraw", KERNELS=="0003:054C:0CE6.*", TAG+="uaccess"` beside it.
 
 ## Development
 

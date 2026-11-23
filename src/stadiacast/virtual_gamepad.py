@@ -22,8 +22,11 @@ through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`).
 ``--gamepad uhid`` is the Linux pad as a wired Stadia Controller instead of an Xbox 360 pad: a HID
 device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which a
 program reads as it reads that controller, Steam and SDL 3 with their Stadia support, Assistant
-and Capture included. A backend like it, which needs more than XInput's fields, says so with
-``takes_state`` and is given the whole :class:`~stadiacast.gamepad.GamepadState`.
+and Capture included. ``--gamepad dualsense`` (:mod:`stadiacast.dualsense_gamepad`) is the same over
+uhid as a Sony DualSense (``054c:0ce6``) with a deterministic MAC per Stadia serial in Feature
+Report ``0x09``, so Steam Input's native DualSense HIDAPI driver keeps a distinct profile per
+physical controller across wake orders. A backend like these, which needs more than XInput's
+fields, says so with ``takes_state`` and is given the whole :class:`~stadiacast.gamepad.GamepadState`.
 
 :class:`PadBackend` is the small surface the receiver drives, so the tests run the same code
 against a fake pad on every platform.
@@ -39,6 +42,7 @@ from collections import deque
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol
 
+from stadiacast.dualsense_gamepad import DualSensePad
 from stadiacast.errors import SetupError
 from stadiacast.gamepad import XINPUT_LEFT_DEADZONE, XINPUT_RIGHT_DEADZONE, GamepadState
 from stadiacast.ojd_gamepad import OJDPad, find_ojd
@@ -307,8 +311,17 @@ class VirtualGamepads:
                 lambda label: UhidPad(label, controller_uniq(rx.controllers.get(label), label)),
                 kind="uhid",
             )
+        if cfg.gamepad == "dualsense":
+            check_uhid_available("--gamepad dualsense")
+            return cls(
+                cfg,
+                log,
+                rx,
+                lambda label: DualSensePad(label, controller_uniq(rx.controllers.get(label), label)),
+                kind="dualsense",
+            )
         if cfg.gamepad != "vigem":
-            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd, uinput or uhid")
+            raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd, uinput, uhid or dualsense")
         if sys.platform != "win32":
             raise SetupError("--gamepad vigem is Windows only: it drives the ViGEmBus driver through vgamepad")
         try:
@@ -368,6 +381,9 @@ class VirtualGamepads:
         self._apply(label, pad, state)
 
     def _apply(self, label: str, pad: PadBackend, state: GamepadState) -> None:
+        set_battery = getattr(pad, "set_battery", None)
+        if set_battery is not None and (ctl := self.rx.controllers.get(label)) is not None:
+            set_battery(ctl.session["display"]["battery_percent"])
         try:
             apply_state = getattr(pad, "apply_state", None) if getattr(pad, "takes_state", False) else None
             if apply_state is not None:
@@ -455,9 +471,9 @@ class VirtualGamepads:
         if on_error is not None:
             on_error(lambda error: loop.call_soon_threadsafe(self._backend_failed, label, pad, error))
         created: dict[str, Any] = {"kind": self.kind, "slot": pad.slot, "deadzone": self.cfg.gamepad_deadzone}
-        if self.kind in ("uinput", "uhid"):
+        if self.kind in ("uinput", "uhid", "dualsense"):
             created["device"] = getattr(pad, "device", None)
-        if self.kind == "uhid":
+        if self.kind in ("uhid", "dualsense"):
             created["uniq"] = getattr(pad, "uniq", None)
         self.log("gamepad_created", controller=label, **created)
         self.rx.live_changed()
@@ -550,12 +566,12 @@ class VirtualGamepads:
         if self.kind == "ojd":
             for value in out.values():
                 value.update(kind="ojd", profile=self.cfg.gamepad_profile)
-        if self.kind in ("uinput", "uhid"):
+        if self.kind in ("uinput", "uhid", "dualsense"):
             for label, value in out.items():
                 value.update(kind=self.kind)
                 if label in self._pads:
                     value.update(device=getattr(self._pads[label], "device", None))
-                    if self.kind == "uhid":
+                    if self.kind in ("uhid", "dualsense"):
                         value.update(uniq=getattr(self._pads[label], "uniq", None))
         return out
 

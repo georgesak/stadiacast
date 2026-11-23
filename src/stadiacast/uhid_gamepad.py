@@ -265,8 +265,17 @@ def _padded(event: bytes) -> bytes:
     return event.ljust(EVENT_SIZE, b"\0")
 
 
-def create2_event(name: str, phys: str, uniq: str, descriptor: bytes = REPORT_DESCRIPTOR) -> bytes:
-    """``UHID_CREATE2`` for a pad with the controller's ids."""
+def create2_event(
+    name: str,
+    phys: str,
+    uniq: str,
+    descriptor: bytes = REPORT_DESCRIPTOR,
+    *,
+    vendor: int = PAD_VENDOR,
+    product: int = PAD_PRODUCT,
+    version: int = PAD_VERSION,
+) -> bytes:
+    """``UHID_CREATE2`` for a USB HID pad."""
     if len(descriptor) > HID_MAX_DESCRIPTOR_SIZE:
         raise ValueError("report descriptor too long")
     return CREATE2.pack(
@@ -276,9 +285,9 @@ def create2_event(name: str, phys: str, uniq: str, descriptor: bytes = REPORT_DE
         uniq.encode()[:63],
         len(descriptor),
         BUS_USB,
-        PAD_VENDOR,
-        PAD_PRODUCT,
-        PAD_VERSION,
+        vendor,
+        product,
+        version,
         0,
         descriptor,
     )
@@ -292,8 +301,10 @@ def set_report_reply_event(request: int, err: int) -> bytes:
     return SET_REPORT_REPLY.pack(UHID_SET_REPORT_REPLY, request, err)
 
 
-def get_report_reply_event(request: int, err: int) -> bytes:
-    return GET_REPORT_REPLY.pack(UHID_GET_REPORT_REPLY, request, err, 0)
+def get_report_reply_event(request: int, err: int, data: bytes = b"") -> bytes:
+    if len(data) > UHID_DATA_MAX:
+        raise ValueError("feature report reply too long")
+    return GET_REPORT_REPLY.pack(UHID_GET_REPORT_REPLY, request, err, len(data)) + data
 
 
 def event_type(event: bytes) -> int | None:
@@ -359,29 +370,28 @@ class Requests:
 
 
 # ---- the device ------------------------------------------------------------------------------
-def open_uhid() -> int:
+def open_uhid(flag: str = "--gamepad uhid") -> int:
     """Open the kernel's uhid device, or say in a :class:`SetupError` what keeps it shut."""
     if not sys.platform.startswith("linux"):
-        raise SetupError("--gamepad uhid is Linux only: it creates the pad through the kernel's uhid device")
+        raise SetupError(f"{flag} is Linux only: it creates the pad through the kernel's uhid device")
     try:
         return os.open(UHID_PATH, os.O_RDWR | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except FileNotFoundError:
         raise SetupError(
-            f"--gamepad uhid needs the kernel's uhid device and found none ({UHID_PATH}): load it with"
-            " `sudo modprobe uhid`"
+            f"{flag} needs the kernel's uhid device and found none ({UHID_PATH}): load it with `sudo modprobe uhid`"
         ) from None
     except PermissionError:
         raise SetupError(
-            f"--gamepad uhid may not open {UHID_PATH}: run the receiver as root, or give your user the device"
+            f"{flag} may not open {UHID_PATH}: run the receiver as root, or give your user the device"
             " with the udev rule in the README (Virtual Stadia Controller on Linux)"
         ) from None
     except OSError as e:
-        raise SetupError(f"--gamepad uhid cannot open {UHID_PATH}: {e}") from e
+        raise SetupError(f"{flag} cannot open {UHID_PATH}: {e}") from e
 
 
-def check_available() -> None:
+def check_available(flag: str = "--gamepad uhid") -> None:
     """Fail at start-up, in plain words, where a pad could not be created later."""
-    os.close(open_uhid())
+    os.close(open_uhid(flag))
 
 
 def find_hidraw(phys: str, root: str = "/sys/devices/virtual/misc/uhid") -> str | None:

@@ -15,6 +15,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from stadiacast.dualsense_gamepad import DualSensePad, mac_bytes, mac_string
 from stadiacast.gamepad import Button, GamepadState
 from stadiacast.uhid_gamepad import PAD_NAME, UhidPad, input_report
 from tests.test_linux_lab import Game, wait_until
@@ -334,3 +335,53 @@ def test_a_games_force_feedback_reaches_the_motors_through_the_kernels_driver(pa
         wait_until(lambda: levels[-1] == (0, 0))
     finally:
         game.close()
+
+
+def test_the_kernel_takes_the_dualsense_pad_with_its_mac_and_hidraw_reports() -> None:
+    """``DualSensePad`` against the real kernel: ``hid-playstation`` (or ``hid-generic``) binds,
+    ``HID_UNIQ`` carries the deterministic MAC, 64-byte input reports arrive on ``hidraw``, and
+    output report 0x02 sets rumble."""
+    warmup = DualSensePad("lab-ds-first", "99181FFAZ00000")
+    try:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not (warmup.device and _driver(warmup.device) == "playstation"):
+            time.sleep(0.05)
+    finally:
+        warmup.close()
+
+    want_mac = mac_string(mac_bytes("99181FFAZ00123"))
+    pad = DualSensePad("lab-ds", "99181FFAZ00123")
+    try:
+        wait_until(lambda: pad.device is not None and os.path.exists(pad.device))
+        assert pad.device is not None
+        assert f"HID_UNIQ={want_mac}" in _uevent(pad.device)
+        assert _driver(pad.device) in ("playstation", "hid-generic")
+        levels: list[tuple[int, int]] = []
+        pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+        raw = _open_hidraw(pad.device)
+        try:
+            pad.set_battery(75)
+            pad.apply_state(GamepadState(buttons=int(Button.CAPTURE | Button.ASSISTANT | Button.A)))
+            matched: list[bytes] = []
+
+            def got_pressed() -> bool:
+                while True:
+                    try:
+                        pkt = os.read(raw, 128)
+                    except BlockingIOError:
+                        return bool(matched)
+                    if len(pkt) == 64 and pkt[0] == 0x01 and (pkt[8] & 0x20) and (pkt[10] & 0x06) == 0x06:
+                        matched.append(pkt)
+                        return True
+
+            wait_until(got_pressed)
+            assert matched[-1][53] == 7
+            out = bytearray(48)
+            out[0], out[1], out[3], out[4] = 0x02, 0x03, 0x40, 0x80
+            assert os.write(raw, bytes(out)) == 48
+            wait_until(lambda: (0x80, 0x40) in levels)
+        finally:
+            os.close(raw)
+        wait_until(lambda: levels[-1] == (0, 0))
+    finally:
+        pad.close()

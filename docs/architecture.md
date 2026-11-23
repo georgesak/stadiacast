@@ -206,6 +206,15 @@ pad's thread gives it. When the last program closes the pad's nodes the motors a
 since a program that ended while its rumble ran is not there to do it. Both Linux pads are
 closed in a worker thread: the kernel takes a tenth of a second or so to remove a device.
 
+The Linux DualSense pad (`dualsense_gamepad.py`, `--gamepad dualsense`) is a second `uhid`
+backend (`054c:0ce6`) for SteamOS setups with several controllers. Steam's `sdl://` wrapper on
+Linux currently drops `HID_UNIQ` for Stadia and Xbox controllers and assigns profiles by wake
+order, whereas Steam drives a DualSense with its own HIDAPI driver and reads Feature Report
+`0x09` for a 6-byte MAC address (`configset_DS<mac>.vdf`). Each controller's serial hashes to a
+deterministic locally-administered MAC, answered on `GET_REPORT` alongside calibration (`0x05`)
+and firmware (`0x20`), while Capture maps to Mic Mute, Assistant to Touchpad click, the battery
+gauge feeds `status[0]`, and USB output report `0x02` brings rumble back.
+
 **`RtcEndpoint`** is one UDP socket and one peer. It demultiplexes datagrams (STUN / DTLS /
 RTP), runs the connectivity checks and keepalives, drives the DTLS handshake through pyOpenSSL
 memory BIOs, exports SRTP keys, and delivers application data (`raw_dtls` sessions) or decrypted
