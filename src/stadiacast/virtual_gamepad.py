@@ -48,6 +48,7 @@ from stadiacast.uinput_gamepad import UinputPad, check_available
 
 if TYPE_CHECKING:
     from stadiacast.config import Config
+    from stadiacast.controller import ControllerSession
     from stadiacast.receiver import Receiver
 
 #: XInput ``wButtons`` bit -> ``vgamepad.XUSB_BUTTON`` name, 1:1 with the mask. Bits 12..15 carry
@@ -81,6 +82,18 @@ PENDING_TRANSITIONS = 32
 def _wording(error: Exception) -> str:
     """An error for the log and ``/_status``: our own wording as plain text, a driver's as its repr."""
     return str(error) if isinstance(error, SetupError) else repr(error)
+
+
+def controller_uniq(ctl: ControllerSession | None, label: str) -> str:
+    """A controller's stable identifier for its virtual pad: its serial, else its device id, else ``label``.
+
+    SDL's HIDAPI treats an all-zero serial as absent, so one like that is passed over too.
+    """
+    if ctl is not None:
+        for value in (ctl.serial, ctl.device_id):
+            if value and (clean := value.strip()) and clean.strip("0"):
+                return clean
+    return label
 
 
 class PadBackend(Protocol):
@@ -287,7 +300,13 @@ class VirtualGamepads:
             return cls(cfg, log, rx, UinputPad, kind="uinput")
         if cfg.gamepad == "uhid":
             check_uhid_available()  # the same for uhid
-            return cls(cfg, log, rx, UhidPad, kind="uhid")
+            return cls(
+                cfg,
+                log,
+                rx,
+                lambda label: UhidPad(label, controller_uniq(rx.controllers.get(label), label)),
+                kind="uhid",
+            )
         if cfg.gamepad != "vigem":
             raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd, uinput or uhid")
         if sys.platform != "win32":
@@ -438,6 +457,8 @@ class VirtualGamepads:
         created: dict[str, Any] = {"kind": self.kind, "slot": pad.slot, "deadzone": self.cfg.gamepad_deadzone}
         if self.kind in ("uinput", "uhid"):
             created["device"] = getattr(pad, "device", None)
+        if self.kind == "uhid":
+            created["uniq"] = getattr(pad, "uniq", None)
         self.log("gamepad_created", controller=label, **created)
         self.rx.live_changed()
         for state in self._pending.pop(label, ()):
@@ -534,7 +555,17 @@ class VirtualGamepads:
                 value.update(kind=self.kind)
                 if label in self._pads:
                     value.update(device=getattr(self._pads[label], "device", None))
+                    if self.kind == "uhid":
+                        value.update(uniq=getattr(self._pads[label], "uniq", None))
         return out
 
 
-__all__ = ["BUTTON_BITS", "MOTOR_SCALE", "PadBackend", "ViGEmPad", "VirtualGamepads", "occupied_xinput_slots"]
+__all__ = [
+    "BUTTON_BITS",
+    "MOTOR_SCALE",
+    "PadBackend",
+    "ViGEmPad",
+    "VirtualGamepads",
+    "controller_uniq",
+    "occupied_xinput_slots",
+]

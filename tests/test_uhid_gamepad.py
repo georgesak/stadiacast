@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -47,8 +48,9 @@ from stadiacast.uhid_gamepad import (
     state_from_xinput,
     stick_byte,
 )
-from stadiacast.virtual_gamepad import VirtualGamepads
-from tests.helpers import connect_firmware_flow, make_receiver, single, wait_for
+from stadiacast.virtual_gamepad import VirtualGamepads, controller_uniq
+from tests.fake_controller import FakeController
+from tests.helpers import connect_firmware_flow, fake, make_receiver, single, wait_for
 
 
 def wait_until(cond: Callable[[], bool], timeout: float = 3.0) -> None:
@@ -431,16 +433,17 @@ def kernel(monkeypatch) -> Iterator[socket.socket]:
 PHYS = f"stadiacast/{os.getpid()}/c0"
 
 
-def _create_pad(kernel: socket.socket) -> uhid.UhidPad:
+def _create_pad(kernel: socket.socket, uniq: str | None = None) -> uhid.UhidPad:
     """A pad made the way the receiver makes one, with the kernel's part played: it sends its
     create event and is ready once it is told the device has started."""
     made: list[uhid.UhidPad] = []
-    creating = threading.Thread(target=lambda: made.append(uhid.UhidPad("c0")))
+    creating = threading.Thread(target=lambda: made.append(uhid.UhidPad("c0", uniq)))
     creating.start()
     create = kernel.recv(EVENT_SIZE * 2)
     assert len(create) == EVENT_SIZE and struct.unpack_from("=I", create) == (UHID_CREATE2,)
     assert create[4:40] == b"Google LLC Stadia Controller rev. A\0"
     assert create[132:196].rstrip(b"\0") == PHYS.encode()  # the pad's own: this process, this controller
+    assert create[196:260].rstrip(b"\0") == (uniq or "c0").encode()
     assert struct.unpack_from("=II", create, 264) == (0x18D1, 0x9400)
     creating.join(0.2)
     assert creating.is_alive()  # nothing before a driver has taken the device
@@ -485,8 +488,8 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
     """The whole pad against a socket pair that plays the kernel: the device is created and
     started, a SET_REPORT is answered and its rumble handed on, a hidraw write too, input becomes
     INPUT2 events, and closing the file is the end of it."""
-    pad = _create_pad(kernel)
-    assert pad.device == "/dev/hidraw9"
+    pad = _create_pad(kernel, uniq="99181FFAZ00123")
+    assert pad.device == "/dev/hidraw9" and pad.uniq == "99181FFAZ00123"
     assert _reports(kernel, 1) == [REST]  # at rest from its start, before any input
 
     levels: list[tuple[int, int]] = []
@@ -612,8 +615,9 @@ class _FakeUhidPad:
     slot = None
     takes_state = True
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, uniq: str | None = None) -> None:
         self.label = label
+        self.uniq = ((uniq or "").strip() or label).encode()[:63].decode("utf-8", "ignore") or label
         self.device = f"/dev/hidraw{40 + len(self.created)}"
         self.states: list[GamepadState] = []
         self.rumble_cb: Any = None
@@ -679,11 +683,19 @@ def test_a_stadia_pad_gets_the_whole_state_and_the_games_rumble_comes_back(tmp_p
             state = pad.states[-1]
             assert state.buttons == held and state.l2 == 200
             assert (state.lx, state.ly) == (0, 0) and state.rx > 0  # inside, and past, XInput's deadzones
+            assert pad.uniq == "fake-device"
             assert rx.status()["gamepads"] == {
-                "c0": {"slot": None, "frames": 1, "rumbles": 0, "kind": "uhid", "device": "/dev/hidraw40"}
+                "c0": {
+                    "slot": None,
+                    "frames": 1,
+                    "rumbles": 0,
+                    "kind": "uhid",
+                    "device": "/dev/hidraw40",
+                    "uniq": "fake-device",
+                }
             }
             created = [r for r in rx.log.records if r["event"] == "gamepad_created"]
-            assert [(r["kind"], r["device"]) for r in created] == [("uhid", "/dev/hidraw40")]
+            assert [(r["kind"], r["device"], r["uniq"]) for r in created] == [("uhid", "/dev/hidraw40", "fake-device")]
 
             pad.rumble_cb(255, 64)
             await wait_for(lambda: rumbles)
@@ -692,6 +704,87 @@ def test_a_stadia_pad_gets_the_whole_state_and_the_games_rumble_comes_back(tmp_p
             fc.power_off()
             await wait_for(lambda: single(rx).session["state"] == "dtls-closed")
             assert pad.closed and rx.status()["gamepads"] == {}
+        finally:
+            fc.close()
+            await rx.stop()
+
+    asyncio.run(run())
+
+
+def test_controller_uniq_prefers_serial_then_device_id_then_label():
+    """SDL's HIDAPI reads HID_UNIQ as the controller's serial and treats all-zero serials as empty."""
+
+    def ctl(serial: str | None, device_id: str | None) -> Any:
+        return SimpleNamespace(serial=serial, device_id=device_id)
+
+    assert controller_uniq(ctl(" 99181FFAZ00123 ", "uuid-1"), "c0") == "99181FFAZ00123"
+    assert controller_uniq(ctl(None, "uuid-1"), "c0") == "uuid-1"
+    assert controller_uniq(ctl("00000000", "uuid-1"), "c0") == "uuid-1"
+    assert controller_uniq(ctl("  ", "0000"), "c0") == "c0"
+    assert controller_uniq(None, "c1") == "c1"
+
+
+def test_two_stadia_pads_keep_their_own_serials_whatever_order_they_wake_in(tmp_path, monkeypatch):
+    """Two controllers waking in opposite order across receiver runs still give Steam their own
+    serials in ``HID_UNIQ``, rather than swapping ``c0`` and ``c1``."""
+    monkeypatch.setattr(virtual_gamepad, "check_uhid_available", lambda: None)
+    monkeypatch.setattr(virtual_gamepad, "UhidPad", _FakeUhidPad)
+
+    async def wake_pair(run_name: str, order: tuple[tuple[str, str], tuple[str, str]]) -> dict[str, str]:
+        _FakeUhidPad.created.clear()
+        rx = make_receiver(tmp_path / run_name, gamepad="uhid", display_rpc_delay=0.05, display_rpc_interval=0.1)
+        await rx.start()
+        fakes: list[FakeController] = []
+        try:
+            for index, (dev, serial) in enumerate(order):
+                fc = fake(rx, dev)
+                fc.serial_number = serial
+                fc.rpc_headers = lambda s=serial, c=fc.cloud_device_id: [  # type: ignore[method-assign]
+                    ("controller-device-id", s),
+                    ("controller-cloud-device-id", c),
+                ]
+                fakes.append(fc)
+                await fc.boot()
+                await fc.start_udp()
+                await fc.discover()
+                await fc.poll_gmsg()
+                await fc.poll_gmsg()
+                fc.connect()
+                await fc.wait_connected(10)
+                await asyncio.wait_for(fc.display_ready.wait(), 5)
+                await fc.keepalive()
+                assert fc.send_input_rpc(buttons=1 << (12 + index))
+            await wait_for(lambda: len(_FakeUhidPad.created) == 2 and all(p.states for p in _FakeUhidPad.created))
+            return {pad.label: pad.uniq for pad in _FakeUhidPad.created}
+        finally:
+            for fc in fakes:
+                fc.close()
+            await rx.stop()
+
+    first = ("ctl-white", "99181FFAZ00AAA")
+    second = ("ctl-wasabi", "99181FFAZ00BBB")
+    assert asyncio.run(wake_pair("run1", (first, second))) == {"c0": "99181FFAZ00AAA", "c1": "99181FFAZ00BBB"}
+    assert asyncio.run(wake_pair("run2", (second, first))) == {"c0": "99181FFAZ00BBB", "c1": "99181FFAZ00AAA"}
+
+
+def test_a_pad_gets_the_controller_state_serial_when_no_header_came(tmp_path, monkeypatch):
+    """When no ``controller-device-id`` header arrived, ``GetControllerStateResponse.f17`` is
+    still known before READY and becomes the pad's ``uniq``."""
+    monkeypatch.setattr(virtual_gamepad, "check_uhid_available", lambda: None)
+    monkeypatch.setattr(virtual_gamepad, "UhidPad", _FakeUhidPad)
+    monkeypatch.setattr(FakeController, "rpc_headers", lambda _self: [])
+    _FakeUhidPad.created.clear()
+
+    async def run() -> None:
+        rx = make_receiver(tmp_path, gamepad="uhid", display_rpc_delay=0.05)
+        await rx.start()
+        fc = await connect_firmware_flow(rx)
+        try:
+            await asyncio.wait_for(fc.display_ready.wait(), 5)
+            await fc.keepalive()
+            assert fc.send_input_rpc(buttons=int(Button.A))
+            await wait_for(lambda: _FakeUhidPad.created and _FakeUhidPad.created[0].states)
+            assert _FakeUhidPad.created[0].uniq == "FAKESERIAL0001"
         finally:
             fc.close()
             await rx.stop()

@@ -179,9 +179,12 @@ destroy the device first can cross a game's request on the way.
 
 The Linux Stadia pad (`uhid_gamepad.py`, `--gamepad uhid`) is a HID device the receiver creates
 through `/dev/uhid`, with the kernel's events packed in the module. It has the wired
-controller's ids and name and sends its input report, so a program reads it the way it reads
-that controller. Steam and SDL 3 read the report itself from the pad's `hidraw` node, with
-their Stadia driver. SDL 2, whose HID code passes over a device without a USB parent, browsers
+controller's ids and name, puts the controller's own serial (or device id) in `uniq`
+(`HID_UNIQ`), and sends its input report, so a program reads it the way it reads that
+controller. Steam and SDL 3 read the report itself from the pad's `hidraw` node, with their
+Stadia driver, and read `HID_UNIQ` as the controller's serial number so each controller keeps
+its own profile whatever order they wake in. SDL 2, whose HID code passes over a device without
+a USB parent, browsers
 and the rest read the event device the kernel makes of the report descriptor, with the mapping
 they keep for these ids. That mapping goes by the buttons' numbers, which count the key codes
 in rising order, so the descriptor, which is written in the module and is not the

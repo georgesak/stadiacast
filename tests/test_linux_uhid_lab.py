@@ -92,8 +92,20 @@ def _driver(hidraw: str) -> str:
     return os.path.basename(os.path.realpath(f"/sys/class/hidraw/{os.path.basename(hidraw)}/device/driver"))
 
 
+def _uevent(hidraw: str) -> list[str]:
+    """The lines of the HID device's ``uevent`` file, where SDL's HIDAPI reads ``HID_UNIQ``."""
+    with open(f"/sys/class/hidraw/{os.path.basename(hidraw)}/device/uevent", encoding="utf-8") as f:
+        return f.read().splitlines()
+
+
 def test_the_kernel_takes_the_pad_for_a_stadia_controller(pad: UhidPad) -> None:
     assert pad.device is not None and os.path.exists(pad.device)
+    assert f"HID_UNIQ={pad.uniq}" in _uevent(pad.device)
+    named = UhidPad("lab-serial", "99181FFAZ00123")
+    try:
+        assert named.device is not None and "HID_UNIQ=99181FFAZ00123" in _uevent(named.device)
+    finally:
+        named.close()
     game = Game(_event_node(pad.device))
     try:
         assert game.identity() == (0x03, 0x18D1, 0x9400, 0x0100)

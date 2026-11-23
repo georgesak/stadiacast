@@ -1,12 +1,14 @@
 """Linux virtual Stadia Controllers through the kernel's uhid device.
 
 ``--gamepad uhid`` gives each controller a HID device with the wired Stadia Controller's identity
-(USB ``18d1:9400`` and its name) and its input report (report 3), instead of the Xbox 360 pad of
-``--gamepad uinput``. A program then reads it the way it reads that controller:
+(USB ``18d1:9400``, its name, and the controller's own serial in ``HID_UNIQ``) and its input report
+(report 3), instead of the Xbox 360 pad of ``--gamepad uinput``. A program then reads it the way it
+reads that controller:
 
 - Steam and SDL 3 through the pad's ``hidraw`` node, with their Stadia driver. It has the two
   buttons an Xbox pad has no place for, Assistant and Capture (SDL 3's ``misc2`` and ``misc1``),
-  and writes its rumble to the same node.
+  reads ``HID_UNIQ`` as the controller's serial number (so each controller keeps its own profile
+  whatever order they wake in), and writes its rumble to the same node.
 - SDL 2, whose HID code passes over a device that has no USB parent, browsers and everything
   else through the event device the kernel makes of the report descriptor, with the mapping they
   keep for these ids.
@@ -417,6 +419,7 @@ class UhidPad:
     #: How long after a start the hidraw node is looked for (seconds).
     NODE_WAIT = 1.0
     label: str
+    uniq: str  # HID_UNIQ: the controller's serial (or id), read by SDL/Steam as its serial number
     device: str | None  # the hidraw node, e.g. /dev/hidraw7
     _phys: str
     _poll: Any
@@ -435,12 +438,13 @@ class UhidPad:
     _wake_w: int
     _thread: threading.Thread
 
-    def __init__(self, label: str) -> None:
+    def __init__(self, label: str, uniq: str | None = None) -> None:
         if not sys.platform.startswith("linux"):
             raise SetupError("--gamepad uhid is Linux only: it creates the pad through the kernel's uhid device")
         import select
 
         self.label = label
+        self.uniq = ((uniq or "").strip() or label).encode()[:63].decode("utf-8", "ignore") or label
         self.device = None
         self._phys = f"stadiacast/{os.getpid()}/{label}"  # what the pad's nodes are found by: no other's
         self._requests = Requests()
@@ -459,7 +463,7 @@ class UhidPad:
         self._poll.register(self._fd, select.POLLIN)
         self._poll.register(self._wake_r, select.POLLIN)
         try:
-            os.write(self._fd, create2_event(PAD_NAME, self._phys, label))
+            os.write(self._fd, create2_event(PAD_NAME, self._phys, self.uniq))
             self._wait_started()
         except SetupError:
             self._close_files()
