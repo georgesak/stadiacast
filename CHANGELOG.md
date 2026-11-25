@@ -35,6 +35,9 @@ All notable changes to this project are documented here. The format follows
 ### Fixed
 - On Windows, two controllers that connect at the same moment are no longer both listed as
   the same XInput player in `/_status`.
+- On Linux, a game that was killed while it rumbled a Stadia pad through its `hidraw` node
+  left the controller's motors running for as long as another program read the pad. They stop
+  when nobody has the node any more.
 
 ## [1.3.0] - 2026-11-18
 

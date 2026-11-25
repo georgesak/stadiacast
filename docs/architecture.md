@@ -179,31 +179,38 @@ destroy the device first can cross a game's request on the way.
 
 The Linux Stadia pad (`uhid_gamepad.py`, `--gamepad uhid`) is a HID device the receiver creates
 through `/dev/uhid`, with the kernel's events packed in the module. It has the wired
-controller's ids and name, puts the controller's own serial (or device id) in `uniq`
-(`HID_UNIQ`), and sends its input report, so a program reads it the way it reads that
-controller. Steam and SDL 3 read the report itself from the pad's `hidraw` node, with their
-Stadia driver, and read `HID_UNIQ` as the controller's serial number so each controller keeps
-its own profile whatever order they wake in. SDL 2, whose HID code passes over a device without
-a USB parent, browsers
-and the rest read the event device the kernel makes of the report descriptor, with the mapping
-they keep for these ids. That mapping goes by the buttons' numbers, which count the key codes
-in rising order, so the descriptor, which is written in the module and is not the
-controller's, gives the event device the controller's key codes, axes and ranges exactly.
-The shared code hands this pad the whole `GamepadState` (`takes_state`), since XInput's fields
-have no room for Assistant and Capture.
+controller's ids and name, states the controller's serial number as its own (`HID_UNIQ`; the
+device id or the label for want of one) and sends its input report, so a program reads it the
+way it reads that controller. Steam and SDL 3 read the report itself from the pad's `hidraw`
+node, with their Stadia driver. SDL 2, whose HID code passes over a device without a USB
+parent, browsers and the rest read the event device the kernel makes of the report descriptor,
+with the mapping they keep for these ids. That mapping goes by the buttons' numbers, which
+count the key codes in rising order, so the descriptor, which is written in the module and is
+not the controller's, gives the event device the controller's key codes, axes and ranges
+exactly. The shared code hands this pad the whole `GamepadState` (`takes_state`), since
+XInput's fields have no room for Assistant and Capture.
 
 The kernel starts the device once for every HID driver that takes it: the first pad after a
-boot goes to the generic driver and then, once udev has loaded it, to the kernel's Stadia
-driver (`hid-google-stadiaff`), with a new event device that knows no report and reads its
+boot goes to the generic driver and then, once udev has loaded it, to the kernel's driver for
+its ids (`hid-google-stadiaff`), with a new event device that knows no report and reads its
 sticks as held in a corner. A driver that is taking the device also drops the input written
 meanwhile, and nothing says when it is done. A program that opens the `hidraw` node sees only
 what is written from then on, and SDL's Stadia driver starts from a state in which the D-pad
-is held up. So the pad's thread writes the state again every 100 ms while nothing changes:
-the kernel hands such a report to the `hidraw` readers and makes no event of it on the event
-device. Rumble arrives as output report 5 in two ways, a write to the `hidraw` node and a
-request of the kernel's driver for a game's force feedback, which waits for its answer: the
-pad's thread gives it. When the last program closes the pad's nodes the motors are stopped,
-since a program that ended while its rumble ran is not there to do it. Both Linux pads are
+is held up. So the pad says it is at rest from the moment it is made, and its thread writes
+the state again every 100 ms while nothing changes, and every 2 ms for a moment after a start
+and after a program opened the `hidraw` node: the kernel hands such a report to the `hidraw`
+readers and makes no event of it on the event device. Rumble arrives as output report 5 in two
+ways, a write to the `hidraw` node and a request of the kernel's driver for a game's force
+feedback, which waits for its answer: the pad's thread gives it.
+
+A program that ended while its rumble ran is not there to stop it. uhid says when the last
+program closes the pad's nodes, and the motors are stopped then; but a program that reads the
+event device keeps that word from coming, and so does a driver that holds its device open.
+So the pad watches its `hidraw` node with inotify, and when a program lets go of the node
+while a rumble is on, it looks in `/proc` for one that still has it and stops the motors where
+there is none. That takes a node the receiver's user may read, which the README's rule gives
+it, and it sees the programs of that user only, or everybody's as root. A device that its driver let go of and no other took, which is how the kernel
+refuses a pad, is reported as failed (`on_error`) after two seconds. Both Linux pads are
 closed in a worker thread: the kernel takes a tenth of a second or so to remove a device.
 
 The Linux DualSense pad (`dualsense_gamepad.py`, `--gamepad dualsense`) is a second `uhid`

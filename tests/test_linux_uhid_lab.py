@@ -1,9 +1,10 @@
-"""The Linux Stadia pad against the real kernel: the device uhid creates from the report
-descriptor, read back through its hidraw node the way SDL 3 reads it and through its event node
-the way everything else does, rumble written to the hidraw node the way SDL 3 writes it, and a
-game's force feedback through the kernel's hid-google-stadiaff driver. Runs on Linux when
-STADIACAST_LINUX_LAB is set, with the right to open ``/dev/uhid`` and the pad's nodes (as root, or
-with the udev rules of the README); a Stadia Controller appears on the system while one runs."""
+"""The Linux Stadia pad and the DualSense pad against the real kernel: the device uhid creates
+from the report descriptor, read back through its hidraw node the way SDL 3 reads it and through
+its event node the way everything else does, rumble written to the hidraw node the way SDL 3
+writes it, and a game's force feedback through the kernel's driver for the pad
+(hid-google-stadiaff, hid-playstation). Runs on Linux when STADIACAST_LINUX_LAB is set, with the
+right to open ``/dev/uhid`` and the pads' nodes (as root, or with the udev rules of the README);
+a Stadia Controller and a DualSense appear on the system while it runs."""
 
 from __future__ import annotations
 
@@ -234,8 +235,10 @@ def test_input_reaches_the_hidraw_node_as_the_report_and_the_event_node_as_keys(
         state = GamepadState(buttons=int(Button.ASSISTANT | Button.CAPTURE | Button.A | Button.X), lx=32767, l2=255)
         pad.apply_state(state)
         reports: list[bytes] = []
-        wait_until(lambda: bool(reports.extend(waiting()) or reports))
-        assert reports[0] == input_report(state)  # what SDL's Stadia driver reads
+        wait_until(lambda: bool(reports.extend(waiting())) or input_report(state) in reports)
+        # What SDL's Stadia driver reads: the pad at rest, which it was told when it opened the
+        # node, and then the state.
+        assert set(reports) <= {input_report(GamepadState()), input_report(state)}
         events: list[tuple[int, int, int]] = []
         wait_until(lambda: bool(events.extend(game.events()) or (EV_KEY, BTN_TRIGGER_HAPPY1, 1) in events))
         pressed = {code for kind, code, value in events if kind == EV_KEY and value == 1}
@@ -283,6 +286,26 @@ def test_a_rumble_left_running_stops_when_its_program_closes_the_pad(pad: UhidPa
     finally:
         os.close(raw)
     wait_until(lambda: levels[-1] == (0, 0))
+
+
+def test_a_rumble_left_running_stops_though_another_program_has_the_pads_event_node(pad: UhidPad) -> None:
+    """The kernel's word that the pad is closed only comes when nobody has any of its nodes. A
+    program that reads the event node, as a launcher does all day, would keep the motors on for
+    a game that was killed: the pad hears its hidraw node let go of, and sees that nobody has it."""
+    assert pad.device is not None
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    launcher = Game(_event_node(pad.device))
+    try:
+        raw = _open_hidraw(pad.device)
+        try:
+            os.write(raw, b"\x05\x00\x80\x00\x40")
+            wait_until(lambda: (0x80, 0x40) in levels)
+        finally:
+            os.close(raw)
+        wait_until(lambda: levels[-1] == (0, 0))
+    finally:
+        launcher.close()
 
 
 def test_a_driver_that_takes_the_pad_anew_finds_the_state_it_had(pad: UhidPad) -> None:

@@ -38,12 +38,14 @@ from stadiacast.uhid_gamepad import (
     UHID_SET_REPORT_REPLY,
     UHID_START,
     UHID_STOP,
+    NodeWatch,
     Requests,
     create2_event,
     find_hidraw,
     hat_value,
     input2_event,
     input_report,
+    node_events,
     rumble_levels,
     state_from_xinput,
     stick_byte,
@@ -97,7 +99,7 @@ def _walk(descriptor: bytes) -> tuple[list[dict[str, Any]], int]:
     items: list[dict[str, Any]] = []
     glob: dict[str, int] = {"report_id": 0, "size": 0, "count": 0, "page": 0, "low": 0, "high": 0}
     usages: list[int] = []
-    depth, i = 0, 0
+    depth, i, first = 0, 0, 0
     while i < len(descriptor):
         prefix = descriptor[i]
         size = (0, 1, 2, 4)[prefix & 3]
@@ -110,13 +112,18 @@ def _walk(descriptor: bytes) -> tuple[list[dict[str, Any]], int]:
                 glob[key] = value
         elif kind == 2 and tag == 0:  # local: usage
             usages.append(value)
+        elif kind == 2 and tag == 1:  # local: the first of a run of usages
+            first = value
+        elif kind == 2 and tag == 2:  # local: its last
+            usages.extend(range(first, value + 1))
         elif kind == 0:  # main
             if tag == 0xA:
                 depth += 1
             elif tag == 0xC:
                 depth -= 1
-            elif tag in (0x8, 0x9):
-                items.append({"kind": "input" if tag == 0x8 else "output", "flags": value, **glob, "usages": usages})
+            elif tag in (0x8, 0x9, 0xB):
+                what = {0x8: "input", 0x9: "output", 0xB: "feature"}[tag]
+                items.append({"kind": what, "flags": value, **glob, "usages": usages})
             usages = []
     return items, depth
 
@@ -413,15 +420,23 @@ def test_the_hidraw_node_is_found_by_the_pads_physical_path(tmp_path):
 
 
 @pytest.fixture
-def kernel(monkeypatch) -> Iterator[socket.socket]:
+def node(tmp_path) -> str:
+    """A file in place of the pad's hidraw node, which programs open and let go of."""
+    path = tmp_path / "hidraw9"
+    path.write_bytes(b"")
+    return str(path)
+
+
+@pytest.fixture
+def kernel(monkeypatch, node) -> Iterator[socket.socket]:
     """A socket pair in place of ``/dev/uhid``: the test holds the kernel's end and the pad opens
     the other. A sequenced-packet socket keeps each event whole, as the kernel's file does."""
     ours_end, pads_end = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     os.set_blocking(pads_end.fileno(), False)
     fd = os.dup(pads_end.fileno())
     pads_end.close()
-    monkeypatch.setattr(uhid, "open_uhid", lambda: fd)
-    monkeypatch.setattr(uhid, "find_hidraw", lambda phys, _root="": "/dev/hidraw9" if phys == PHYS else None)
+    monkeypatch.setattr(uhid, "open_uhid", lambda _flag="": fd)
+    monkeypatch.setattr(uhid, "find_hidraw", lambda phys, _root="": node if phys == PHYS else None)
     ours_end.settimeout(5)
     try:
         yield ours_end
@@ -484,12 +499,12 @@ linux_only = pytest.mark.skipif(
 
 
 @linux_only
-def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
+def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel, node):
     """The whole pad against a socket pair that plays the kernel: the device is created and
     started, a SET_REPORT is answered and its rumble handed on, a hidraw write too, input becomes
     INPUT2 events, and closing the file is the end of it."""
     pad = _create_pad(kernel, uniq="99181FFAZ00123")
-    assert pad.device == "/dev/hidraw9" and pad.uniq == "99181FFAZ00123"
+    assert pad.device == node and pad.uniq == "99181FFAZ00123"
     assert _reports(kernel, 1) == [REST]  # at rest from its start, before any input
 
     levels: list[tuple[int, int]] = []
@@ -513,7 +528,19 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
 
 
 @linux_only
-def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_its_node(kernel, monkeypatch):
+def test_a_new_pad_says_at_once_that_it_is_at_rest(kernel, monkeypatch):
+    """Not at the state's next turn, which is a tenth of a second away and here much longer: a
+    driver has just taken the device, and what it makes of the pad knows no report yet."""
+    monkeypatch.setattr(uhid.UhidPad, "REFRESH", 30.0)
+    pad = _create_pad(kernel)
+    try:
+        assert _reports(kernel, 1, within=1.0) == [REST]
+    finally:
+        pad.close()
+
+
+@linux_only
+def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_its_node(kernel, node, monkeypatch):
     """The kernel drops the input written while a HID driver takes the device, a new driver's
     event device knows no report, and a program that opens the hidraw node has seen none: the
     pad repeats its state at a steady pace, so each has it a moment later. A change is written
@@ -554,7 +581,7 @@ def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_
     assert written()[-1] == changed  # written at once, not at the next turn
     repeats(changed, 3)
 
-    assert pad.device == "/dev/hidraw9"
+    assert pad.device == node
     monkeypatch.setattr(uhid, "find_hidraw", lambda _phys, _root="": "/dev/hidraw12")
     kernel.send(_plain(UHID_STOP))
     kernel.send(_plain(UHID_START))  # another driver has the device, with a node of its own
@@ -604,6 +631,307 @@ def test_a_rumble_left_running_stops_when_the_last_program_closes_the_pad(kernel
     wait_until(lambda: levels == [(0xC0, 0x20)])
     kernel.send(_plain(UHID_CLOSE))  # the program is gone, its rumble still on
     wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+    pad.close()
+
+
+def _node_event(watch: int, what: int, name: bytes = b"") -> bytes:
+    return struct.pack("=iIII", watch, what, 0, len(name)) + name
+
+
+def test_the_nodes_events_are_read_for_the_watch_they_belong_to():
+    opened, closed_for_writing, closed, removed = 0x20, 0x08, 0x10, 0x8000
+    data = (
+        _node_event(3, opened)
+        + _node_event(2, closed)  # an earlier node's: none of this watch's business
+        + _node_event(3, closed_for_writing, b"name\0\0\0\0")  # a name is skipped by its length
+        + _node_event(4, removed)
+        + _node_event(5, closed)[:10]  # what is cut short is no event
+    )
+    assert node_events(data, 3) == (True, True)
+    assert node_events(data, 2) == (False, True)
+    assert node_events(data, 4) == node_events(data, 5) == node_events(b"", 3) == (False, False)
+    assert node_events(_node_event(3, opened) + _node_event(3, closed), 3) == (True, True)
+
+
+def test_a_node_that_cannot_be_watched_says_nothing(tmp_path):
+    """Without inotify, or for a node the receiver may not read, nothing is heard and nothing is
+    said: the pad goes on as it did before it could tell."""
+    watch = NodeWatch()
+    assert not watch.watch(str(tmp_path / "no-such-node")) and not watch.watching
+    assert watch.read() == (False, False)
+    assert not watch.watch(None)
+    watch.close()
+    watch.close()
+    assert watch.fd == -1 and watch.read() == (False, False)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="open files as links in a directory, which is Linux's way")
+def test_a_node_is_held_by_a_process_that_has_it_open(tmp_path):
+    """Who has the node is read where Linux shows every process's open files. A process the
+    receiver may not look into, one that is gone and a node that is gone count for nothing."""
+    node = tmp_path / "hidraw9"
+    other = tmp_path / "other"
+    for file in (node, other):
+        file.write_bytes(b"")
+    proc = tmp_path / "proc"
+    for pid, files in (("101", {"0": other}), ("202", {"3": other, "7": node}), ("self", {"1": node})):
+        (proc / pid / "fd").mkdir(parents=True)
+        for fd, target in files.items():
+            (proc / pid / "fd" / fd).symlink_to(target)
+    (proc / "303").mkdir()  # no fd directory to read: another user's
+    (proc / "404" / "fd").mkdir(parents=True)
+    (proc / "404" / "fd" / "5").symlink_to(tmp_path / "gone")
+    (proc / "404" / "fd" / "6").symlink_to(tmp_path / "hidraw9 (deleted)")  # an earlier node of that name
+    assert uhid.node_is_held(str(node), str(proc))
+    (proc / "202" / "fd" / "7").unlink()
+    assert not uhid.node_is_held(str(node), str(proc))  # "self" is no process: only numbers are
+    # Only a file of the node's name is asked what it is: one on a network that has stopped
+    # answering would hold the pad's thread up, and no program opens the node by another name.
+    alias = tmp_path / "another-name"
+    os.link(node, alias)
+    (proc / "202" / "fd" / "8").symlink_to(alias)
+    assert not uhid.node_is_held(str(node), str(proc))
+    assert not uhid.node_is_held(str(tmp_path / "gone"), str(proc))
+    assert not uhid.node_is_held(str(node), str(tmp_path / "no-proc"))
+
+
+@linux_only
+def test_opening_and_letting_go_of_the_node_is_heard(node):
+    watch = NodeWatch()
+    assert watch.fd >= 0
+    try:
+        assert watch.watch(node) and watch.watching
+        assert watch.read() == (False, False)
+        first = os.open(node, os.O_RDONLY)
+        second = os.open(node, os.O_RDWR)
+        assert watch.read() == (True, False)
+        assert uhid.node_is_held(node)
+        os.close(first)
+        assert watch.read() == (False, True) and uhid.node_is_held(node)
+        os.close(second)
+        assert watch.read() == (False, True) and not uhid.node_is_held(node)
+        assert watch.read() == (False, False)
+        watch.watch(None)
+        os.close(os.open(node, os.O_RDONLY))
+        assert watch.read() == (False, False)  # no longer watched
+    finally:
+        watch.close()
+
+
+@linux_only
+def test_a_program_that_opens_the_node_is_written_the_state_at_once(kernel, node, monkeypatch):
+    """A program reads what is written after it opened the node. It is not left to wait for the
+    state's next turn: the state is written when it opens, and several times in the moment
+    after, since a report can be lost while a driver is still taking the device."""
+    monkeypatch.setattr(uhid.UhidPad, "REFRESH", 30.0)  # nothing is due again in this test
+    pad = _create_pad(kernel)
+    held = input_report(GamepadState(buttons=int(Button.A)))
+    pad.apply_state(GamepadState(buttons=int(Button.A)))
+    assert _reports(kernel, 1, after=REST) == [held]
+    time.sleep(0.2)  # the hurry after the start is over
+    kernel.settimeout(0.3)
+    while True:
+        try:
+            kernel.recv(EVENT_SIZE * 2)
+        except TimeoutError:
+            break
+    program = os.open(node, os.O_RDWR)
+    try:
+        began = time.monotonic()
+        seen = []
+        kernel.settimeout(2)
+        while len(seen) < 5:
+            event = kernel.recv(EVENT_SIZE * 2)
+            assert struct.unpack_from("=IH", event) == (UHID_INPUT2, 10) and event[6:16] == held
+            seen.append(time.monotonic() - began)
+        assert seen[0] < 0.5 and seen[-1] < 1.0  # at once, where its turn was half a minute away
+    finally:
+        os.close(program)
+        pad.close()
+
+
+@linux_only
+def test_a_rumble_stops_when_the_last_program_lets_go_of_the_node(kernel, node):
+    """The kernel's driver for a pad may hold the device open itself, and then uhid never says
+    that the last program closed it. A program that was killed while its rumble ran left the
+    motors on. The pad hears its node let go of, and stops them when nobody has it any more."""
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    game, other = os.open(node, os.O_RDWR), os.open(node, os.O_RDONLY)
+    kernel.send(_output(b"\x05\x00\xc0\x00\x20"))  # as the game's write to the node arrives
+    wait_until(lambda: levels == [(0xC0, 0x20)])
+    os.close(other)
+    time.sleep(0.2)
+    assert levels == [(0xC0, 0x20)]  # the game still has it
+    os.close(game)  # no word from uhid: the driver holds the device
+    wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+    pad.close()
+
+
+@linux_only
+def test_a_new_start_has_the_new_node_watched_though_it_has_the_old_ones_name(kernel, node):
+    """A driver that takes the device makes a new node, often under the old one's name. The
+    watch is of the node and not of the name: it is set again."""
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    os.unlink(node)
+    kernel.send(_plain(UHID_STOP))
+    with open(node, "wb"):
+        pass
+    kernel.send(_plain(UHID_START))
+    time.sleep(0.3)  # the node is looked for and watched
+    game = os.open(node, os.O_RDWR)
+    kernel.send(_output(b"\x05\x00\xc0\x00\x20"))
+    wait_until(lambda: levels == [(0xC0, 0x20)])
+    os.close(game)
+    wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+    pad.close()
+
+
+@linux_only
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root may read any node")
+def test_a_node_the_receiver_is_given_a_moment_later_is_watched_then(kernel, node):
+    """A new hidraw node is root's alone until udev has applied its rules, which takes a moment
+    in which the watch is refused. The pad tries again, and from then on hears the node."""
+    os.chmod(node, 0)
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    try:
+        time.sleep(0.2)
+        assert not pad._opens.watching
+        os.chmod(node, 0o600)  # udev's word
+        wait_until(lambda: pad._opens.watching)
+        game = os.open(node, os.O_RDWR)
+        kernel.send(_output(b"\x05\x00\xc0\x00\x20"))
+        wait_until(lambda: levels == [(0xC0, 0x20)])
+        os.close(game)
+        wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+    finally:
+        pad.close()
+
+
+@linux_only
+def test_a_rumble_written_before_its_program_left_counts_though_the_leaving_is_heard_first(kernel, node, monkeypatch):
+    """A program writes a rumble and is gone. Its report waits in the kernel's queue and its
+    leaving in another, and the pad may come to the leaving first. It reads the kernel's events
+    before it decides, or the rumble it reads a moment later would run on with nobody left to
+    end it."""
+    sent: list[bool] = []
+    heard = uhid.NodeWatch.read
+
+    def read(self):
+        got = heard(self)
+        if got[1] and not sent:  # the leaving is heard, and the report was in the queue all along
+            sent.append(True)
+            kernel.send(_output(b"\x05\x00\xc0\x00\x20"))
+        return got
+
+    monkeypatch.setattr(uhid.NodeWatch, "read", read)
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    try:
+        os.close(os.open(node, os.O_RDWR))
+        wait_until(lambda: bool(sent))
+        time.sleep(0.3)
+        assert pad._requests.levels == (0, 0) and (not levels or levels[-1] == (0, 0))
+    finally:
+        pad.close()
+
+
+@linux_only
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="root may read any node")
+def test_a_rumble_whose_program_left_while_the_node_could_not_be_watched_is_stopped_once_it_can(kernel, node):
+    """A program has the node before the receiver may read it, which is how it is for a moment
+    after the kernel made the node. It rumbles and is killed, and nothing is heard of that. The
+    pad tries the node at every turn, and when it may watch it, it finds a rumble on and nobody
+    there."""
+    game = os.open(node, os.O_RDWR)
+    os.chmod(node, 0)
+    pad = _create_pad(kernel)
+    levels: list[tuple[int, int]] = []
+    pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    try:
+        kernel.send(_output(b"\x05\x00\xc0\x00\x20"))
+        wait_until(lambda: levels == [(0xC0, 0x20)])
+        os.close(game)
+        time.sleep(0.3)
+        assert levels == [(0xC0, 0x20)] and not pad._opens.watching
+        os.chmod(node, 0o600)  # udev's word
+        wait_until(lambda: levels == [(0xC0, 0x20), (0, 0)])
+        assert pad._opens.watching
+    finally:
+        pad.close()
+
+
+@linux_only
+def test_a_driver_that_takes_the_device_is_written_the_state_at_once(kernel, monkeypatch):
+    """What a driver makes of the device knows no report, and what was written while it took
+    the device is lost. The state is not left to its next turn: it is written at once and
+    several times in the moment after the start."""
+    monkeypatch.setattr(uhid.UhidPad, "REFRESH", 30.0)  # no turn of its own in this test
+    pad = _create_pad(kernel)
+    try:
+        time.sleep(0.2)  # the hurry after the first start is over
+        kernel.settimeout(0.3)
+        while True:
+            try:
+                kernel.recv(EVENT_SIZE * 2)
+            except TimeoutError:
+                break
+        kernel.settimeout(2)
+        kernel.send(_plain(UHID_STOP))
+        kernel.send(_plain(UHID_START))
+        began = time.monotonic()
+        for _ in range(5):
+            event = kernel.recv(EVENT_SIZE * 2)
+            assert struct.unpack_from("=IH", event) == (UHID_INPUT2, 10) and event[6:16] == REST
+        assert time.monotonic() - began < 1.0
+    finally:
+        pad.close()
+
+
+@linux_only
+def test_a_pad_whose_device_is_gone_under_it_says_so_and_lets_go_of_its_files(kernel):
+    """The pad's thread ends when the uhid file does. It was not asked to: the receiver is told,
+    where it would go on showing a pad that is none, and the thread closes what it had open."""
+    pad = _create_pad(kernel)
+    told: list[str] = []
+    pad.on_error(told.append)
+    kernel.close()
+    wait_until(lambda: bool(told))
+    assert told == ["the virtual pad's device is gone"]
+    wait_until(lambda: not pad._thread.is_alive())
+    assert (pad._fd, pad._wake_r, pad._wake_w, pad._opens.fd) == (-1, -1, -1, -1)
+    with pytest.raises(SetupError, match="no longer takes reports"):
+        pad.apply_state(GamepadState(buttons=int(Button.A)))
+    pad.close()  # and closing it afterwards is nothing
+
+
+@linux_only
+def test_a_device_that_no_driver_keeps_is_said_to_be_no_pad(kernel, monkeypatch):
+    """The kernel's driver can refuse a device after it started it, and the generic one does not
+    take what another driver is for: the device is there and nothing reads it. A change of
+    driver is a stop and a start close together, and is none of that."""
+    monkeypatch.setattr(uhid.UhidPad, "DRIVER_WAIT", 0.3)
+    pad = _create_pad(kernel)
+    told: list[str] = []
+    pad.on_error(told.append)
+    kernel.send(_plain(UHID_STOP))
+    kernel.send(_plain(UHID_START))  # another driver took it
+    time.sleep(0.6)
+    assert told == []
+    kernel.send(_plain(UHID_CLOSE))
+    kernel.send(_plain(UHID_STOP))  # and let go of it, for good
+    wait_until(lambda: bool(told))
+    time.sleep(0.2)
+    assert told == ["the kernel's driver let go of the virtual pad and no other took it (`dmesg` says why)"]
+    late: list[str] = []
+    pad.on_error(late.append)  # one who asks afterwards is told as well
+    assert late == told
     pad.close()
 
 
