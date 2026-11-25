@@ -633,6 +633,41 @@ def test_more_changes_than_are_kept_while_a_pad_is_created_end_in_the_newest_sta
     asyncio.run(run())
 
 
+def test_a_controller_that_is_back_before_its_pad_is_gone_waits_for_that(tmp_path) -> None:
+    """Removing a pad takes a moment, in a worker thread. A controller that is READY again
+    meanwhile gets its new pad once the old one is gone, not beside it: the kernel refuses a
+    second DualSense with the address of one it still has."""
+    let_go = threading.Event()
+
+    class WaitingPad(_FakePad):
+        close_blocks = True
+
+        def close(self) -> None:
+            assert let_go.wait(3)
+            super().close()
+
+    async def run() -> None:
+        rx = _with_fake_pads(make_receiver(tmp_path), WaitingPad)
+        pads = rx.gamepads
+        try:
+            pads.prepare("c0")
+            await wait_for(lambda: pads.status())
+            (first,) = _FakePad.created
+            pads.release("c0")
+            pads.prepare("c0")  # READY again, the old pad still on its way out
+            await asyncio.sleep(0.2)
+            assert len(_FakePad.created) == 1 and not first.closed and pads.status() == {}
+            let_go.set()
+            await wait_for(lambda: pads.status())
+            assert len(_FakePad.created) == 2 and first.closed and not _FakePad.created[1].closed
+        finally:
+            let_go.set()
+            pads.close()
+            await pads.wait_closed()
+
+    asyncio.run(run())
+
+
 def test_a_pad_whose_close_waits_is_closed_off_the_event_loop(tmp_path) -> None:
     """Closing an OJD feed waits for its process to end. The event loop carries every controller's
     traffic, so that wait belongs to a worker thread, and ``wait_closed`` is what joins it."""

@@ -22,11 +22,11 @@ through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`).
 ``--gamepad uhid`` is the Linux pad as a wired Stadia Controller instead of an Xbox 360 pad: a HID
 device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which a
 program reads as it reads that controller, Steam and SDL 3 with their Stadia support, Assistant
-and Capture included. ``--gamepad dualsense`` (:mod:`stadiacast.dualsense_gamepad`) is the same over
-uhid as a Sony DualSense (``054c:0ce6``) with a deterministic MAC per Stadia serial in Feature
-Report ``0x09``, so Steam Input's native DualSense HIDAPI driver keeps a distinct profile per
-physical controller across wake orders. A backend like these, which needs more than XInput's
-fields, says so with ``takes_state`` and is given the whole :class:`~stadiacast.gamepad.GamepadState`.
+and Capture included. ``--gamepad dualsense`` is that pad as a Sony DualSense
+(:mod:`stadiacast.dualsense_gamepad`), which states an address of its own that Steam knows it by:
+the pad's is made from its controller's serial number. A backend like these, which needs more
+than XInput's fields, says so with ``takes_state`` and is given the whole
+:class:`~stadiacast.gamepad.GamepadState`; one that shows a battery has a ``set_battery``.
 
 :class:`PadBackend` is the small surface the receiver drives, so the tests run the same code
 against a fake pad on every platform.
@@ -89,9 +89,11 @@ def _wording(error: Exception) -> str:
 
 
 def controller_uniq(ctl: ControllerSession | None, label: str) -> str:
-    """A controller's stable identifier for its virtual pad: its serial, else its device id, else ``label``.
+    """What a controller's pad is known by, the same at every boot: its serial number, or else
+    its device id, or else its label, which is only the same while the controllers wake in the
+    same order. Both are known before the link is READY, which is when the pad is made.
 
-    SDL's HIDAPI treats an all-zero serial as absent, so one like that is passed over too.
+    SDL takes a serial number of nothing but zeros for none, so one like that is passed over.
     """
     if ctl is not None:
         for value in (ctl.serial, ctl.device_id):
@@ -283,6 +285,7 @@ class VirtualGamepads:
         self._wanted: set[str] = set()  # the controllers that are there: READY, or sending input
         self._creating: dict[str, asyncio.Task[None]] = {}
         self._closing: set[asyncio.Task[None]] = set()  # pads being closed in a worker thread
+        self._closing_of: dict[str, asyncio.Task[None]] = {}  # label -> the close of its last pad, while it runs
         self._pending: dict[str, deque[GamepadState]] = {}
         self._generation: dict[str, int] = {}
         self._closed = False
@@ -348,8 +351,10 @@ class VirtualGamepads:
         """Begin making the pad of ``label``, unless it has one, is getting one or was refused one."""
         if label in self._pads or label in self._creating or label in self._failed:
             return
+        # A controller that is back before its last pad is gone waits for that: the kernel has
+        # one DualSense per address, and the macOS driver four feeds in all.
         self._creating[label] = asyncio.get_running_loop().create_task(
-            self._create(label, self._generation.get(label, 0))
+            self._create(label, self._generation.get(label, 0), self._closing_of.get(label))
         )
 
     def on_event(self, ev: dict[str, Any]) -> None:
@@ -380,10 +385,13 @@ class VirtualGamepads:
             return
         self._apply(label, pad, state)
 
+    def battery(self, label: str, percent: int | None) -> None:
+        """The controller's battery level, for a pad that shows one to the system."""
+        set_battery = getattr(self._pads.get(label), "set_battery", None)
+        if set_battery is not None:
+            set_battery(percent)
+
     def _apply(self, label: str, pad: PadBackend, state: GamepadState) -> None:
-        set_battery = getattr(pad, "set_battery", None)
-        if set_battery is not None and (ctl := self.rx.controllers.get(label)) is not None:
-            set_battery(ctl.session["display"]["battery_percent"])
         try:
             apply_state = getattr(pad, "apply_state", None) if getattr(pad, "takes_state", False) else None
             if apply_state is not None:
@@ -456,6 +464,9 @@ class VirtualGamepads:
         self._pads[label] = pad
         self._frames.setdefault(label, 0)
         self._rumbles.setdefault(label, 0)
+        ctl = self.rx.controllers.get(label)
+        if ctl is not None:
+            self.battery(label, ctl.session["display"]["battery_percent"])  # known since before READY
         loop = asyncio.get_running_loop()
 
         def forward(large: int, small: int) -> None:  # from ViGEm's thread onto the loop
@@ -541,13 +552,19 @@ class VirtualGamepads:
             else:
                 task = loop.create_task(self._close_in_thread(label, pad))
                 self._closing.add(task)
-                task.add_done_callback(self._closing.discard)
+                self._closing_of[label] = task
+                task.add_done_callback(lambda done: self._closed_pad(label, done))
                 return task
         try:
             pad.close()
         except Exception as e:
             self.log("gamepad_close_failed", controller=label, error=repr(e))
         return None
+
+    def _closed_pad(self, label: str, task: asyncio.Task[None]) -> None:
+        self._closing.discard(task)
+        if self._closing_of.get(label) is task:
+            del self._closing_of[label]
 
     async def _close_in_thread(self, label: str, pad: PadBackend) -> None:
         try:

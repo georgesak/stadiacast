@@ -2,13 +2,13 @@ name: Linux lab
 
 # The Linux-only paths against the real thing, by hand: the uinput device `--gamepad uinput`
 # creates, read back through its event device as a game reads it, a game's force feedback, the
-# whole path from the lab controller to the pad and back to its motors, the HID device
-# `--gamepad uhid` creates, `--audio-source system` recording a tone from a PulseAudio server,
+# whole path from the lab controller to the pad and back to its motors, the HID devices
+# `--gamepad uhid` and `--gamepad dualsense` create, `--audio-source system` recording a tone from a PulseAudio server,
 # and `--mic-device` making a microphone in it. With ffmpeg installed, the sound tests that the
 # regular CI skips run here too. Nothing is released.
 #
-# The pad tests need a kernel with uinput, and the Stadia pad's one with uhid. Where a runner's
-# kernel has none, the step that prepares it says so and they skip; point `runner` at a
+# The pad tests need a kernel with uinput, and the Stadia and DualSense pads' one with uhid. Where
+# a runner's kernel has none, the step that prepares it says so and they skip; point `runner` at a
 # self-hosted Linux machine then.
 
 on:
@@ -69,9 +69,10 @@ jobs:
           fi
           if [ -c /dev/uhid ]; then
             ls -l /dev/uhid
-            modinfo -F filename hid-google-stadiaff || echo "no hid-google-stadiaff: the pad stays with hid-generic"
+            modinfo -F filename hid-google-stadiaff || echo "no hid-google-stadiaff: the Stadia pad stays with hid-generic"
+            modinfo -F filename hid-playstation || echo "no hid-playstation: the DualSense pad stays with hid-generic"
           else
-            echo "::warning::this runner's kernel has no uhid device: the Stadia pad's lab tests skip"
+            echo "::warning::this runner's kernel has no uhid device: the Stadia and DualSense pads' lab tests skip"
           fi
 
       - name: the whole test suite, with the pad on a real kernel where there is one
@@ -110,5 +111,27 @@ jobs:
           print(open("/proc/bus/input/devices").read().split("\n\n")[-2])
           print(subprocess.run(["udevadm", "info", str(pad.device)], capture_output=True, text=True).stdout)
           print(subprocess.run("dmesg | tail -5", shell=True, capture_output=True, text=True).stdout)
+          pad.close()
+          PY
+
+      - name: what the kernel and udev make of a DualSense pad
+        if: env.STADIACAST_LINUX_LAB == '1'
+        run: |
+          [ -w /dev/uhid ] || { echo "no uhid to write to"; exit 0; }
+          uv run python - <<'PY'
+          import glob, os, subprocess, time
+          from stadiacast.dualsense_gamepad import DualSensePad
+
+          pad = DualSensePad("lab", "99181FFAZ00123")
+          pad.set_battery(76)
+          time.sleep(1)
+          device = os.path.realpath(f"/sys/class/hidraw/{os.path.basename(str(pad.device))}/device")
+          print("hidraw node:", pad.device, "address:", pad.uniq, "driver:", os.path.basename(os.path.realpath(device + "/driver")))
+          for name in sorted(glob.glob(device + "/input/input*/name")):
+              print("input device:", open(name).read().strip())
+          for supply in glob.glob(device + "/power_supply/*"):
+              print("battery:", open(supply + "/status").read().strip(), open(supply + "/capacity").read().strip())
+          print(subprocess.run(["udevadm", "info", str(pad.device)], capture_output=True, text=True).stdout)
+          print(subprocess.run("sudo dmesg | tail -8", shell=True, capture_output=True, text=True).stdout)
           pad.close()
           PY

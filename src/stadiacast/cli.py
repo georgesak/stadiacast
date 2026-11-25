@@ -314,9 +314,8 @@ def build_parser(preset: str | None = None) -> argparse.ArgumentParser:
         default="off",
         help="feed input to a virtual pad, one per controller (vigem: Windows; ojd: macOS OpenJoystickDriver; "
         "uinput: Linux, an Xbox 360 pad; uhid: Linux, a wired Stadia Controller, with its Assistant and "
-        "Capture buttons; dualsense: Linux, a DualSense with a per-controller MAC so Steam Input identifies "
-        "each physical controller across wake orders); switches StartGame on so the game's rumble reaches the "
-        "controller",
+        "Capture buttons; dualsense: Linux, a Sony DualSense with an address of its own per controller, which "
+        "Steam knows each one by); switches StartGame on so the game's rumble reaches the controller",
     )
     g.add_argument(
         "--gamepad-deadzone",

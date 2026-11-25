@@ -157,10 +157,10 @@ battery level, headset, headset stream (`playback`) and `microphone`, with `--mi
 device that carries the microphones under `mic_device`, and with `--gamepad` every virtual pad
 under `gamepads`, with its XInput `slot` or the `error` it ended in; a macOS pad has no slot
 and names its `kind` and `profile`, a Linux pad its `kind` and its `device`: the event device a
-game reads (`/dev/input/event7`), or with `--gamepad uhid` / `--gamepad dualsense` the pad's
-`hidraw` node (`/dev/hidraw3`) and `uniq` (the controller's serial, or its derived MAC for
-`dualsense`). `-v` echoes the bulky log fields (request
-bodies, decoded protobufs) to the console too.
+game reads (`/dev/input/event7`), or with `--gamepad uhid` and `--gamepad dualsense` the pad's
+`hidraw` node (`/dev/hidraw3`) and, as `uniq`, what the pad is known by: the controller's
+serial number, or the address made from it. `-v` echoes the bulky log fields (request bodies,
+decoded protobufs) to the console too.
 
 `GET /_input` is the short version, for a program that shows or uses what the controllers do:
 per controller the state of its link (`display_state`, `ready` or `input` once it is up), its
@@ -256,7 +256,7 @@ Events worth knowing when something does not work:
 | `audio_start_failed` | the `--audio-source` stream could not start (`spec` is the source, `error` says why): no ffmpeg with libopus on `PATH`, or the source was refused |
 | `audio_source_invalid` | the `--audio-source` spelling is wrong, or the capture it names cannot be set up on this machine (no loopback device, missing extra) |
 | `audio_capture`, `audio_capture_failed`, `audio_capture_ended` | the capture feeding ffmpeg (`system`, `device:`) started, could not start, or stopped (`error` says why); after a failure ffmpeg exits (`audio_ffmpeg_exited`) and both start again, until the stream is stopped |
-| `gamepad_created`, `gamepad_failed` | `--gamepad`: a controller's virtual pad exists (`slot` is its XInput player on Windows; on macOS the driver's feed was started; on Linux `device` is its event device, or its `hidraw` node and `uniq` with `--gamepad uhid` / `--gamepad dualsense`), or could not be created or stopped working (`error`, shown under `gamepads` in `/_status` too); the controller's next boot tries again |
+| `gamepad_created`, `gamepad_failed` | `--gamepad`: a controller's virtual pad exists (`slot` is its XInput player on Windows; on macOS the driver's feed was started; on Linux `device` is its event device, or its `hidraw` node and its `uniq` with `--gamepad uhid` and `--gamepad dualsense`), or could not be created or stopped working (`error`, shown under `gamepads` in `/_status` too); the controller's next boot tries again |
 | `gamepad_rumble_failed` | the game's rumble could not be forwarded (the game session was not up) |
 | `mic_switch` | the controller was asked for its microphone, or told to stop (`on`), by `--mic on` (`reason` is `autostart`), the Assistant button (`ptt`) or `/_mic` (`api`), or told to stop by the receiver as it stops (`stop`), because sound came unasked (`stray`) or because nothing takes the sound any more (`nowhere`); without a `ticket` nothing was sent: the link was not READY, or (`nowhere`) neither a device nor a recording would have taken the sound |
 | `mic_refused` | the controller answered that request with an error (`code`) |

@@ -1,86 +1,88 @@
 """Linux virtual DualSense controllers through the kernel's uhid device.
 
-``--gamepad dualsense`` gives each Stadia Controller a USB DualSense HID device (``054c:0ce6``)
-with a deterministic locally-administered MAC address derived from the controller's own serial.
+``--gamepad dualsense`` gives each controller a HID device with the identity of a Sony DualSense
+on its cable (USB ``054c:0ce6``), where ``--gamepad uhid`` gives it a wired Stadia Controller's.
+It is there for the pad's address. A DualSense states a Bluetooth address of its own in a feature
+report, on the cable too, and that is what a program knows one from another by: Steam keeps each
+one's name and bindings by it. The address of this pad is made from its controller's serial
+number, so a controller is the same DualSense every time, whatever order the controllers wake in.
 
-Why this exists alongside ``--gamepad uhid``: Steam's ``sdl://`` wrapper on Linux currently drops
-``SDL_GetGamepadSerial()`` (``HID_UNIQ``) for Stadia and Xbox pads and assigns synthetic profiles
-in connection order, whereas Steam drives a DualSense with its own HIDAPI driver, reads Feature
-Report ``0x09`` (pairing info) for the 6-byte MAC address, and stores each controller's name,
-calibration and bindings under ``configset_DS<mac>.vdf``. Because SteamOS already ships a
-``uaccess`` udev rule matching ``KERNELS=="*054C:0CE6*"``, only ``/dev/uhid`` itself needs access.
+The pad is :class:`~stadiacast.uhid_gamepad.UhidPad` with other reports, and is read in three
+ways:
 
-All seventeen Stadia controls map onto the DualSense USB input report (report ``0x01``, 64 bytes):
-A/B/X/Y to Cross/Circle/Square/Triangle, Options (``⋯``) to Create, Menu (``≡``) to Options, the
-Stadia button to PS, Capture to Mic Mute (SDL's ``misc1``), and Assistant to Touchpad click. Both
-touch contacts stay marked inactive (``0x80``) so the cursor never drifts, and the controller's
-battery gauge, when known, is reported in ``status[0]``. Feature reports ``0x05`` (calibration),
-``0x09`` (MAC) and ``0x20`` (firmware ``0x0224``, which enables full-range v2 rumble in both SDL 3
-and the kernel's ``hid-playstation`` driver) are answered on the pad's own thread, and USB output
-report ``0x02`` carries rumble back to the Stadia Controller.
+- Steam and SDL 3 read the pad's ``hidraw`` node with their DualSense driver: every control, with
+  Capture as the microphone button (SDL's ``misc1``) and Assistant as the click of the touchpad,
+  the battery, and rumble written to the same node. SDL's driver waits 16 ms for a first report
+  from a pad it has just opened, and takes one that shows none for a pad on Bluetooth, which it
+  asks for neither its address nor its firmware. So the pad reports all the time, as a DualSense
+  does, and at once when a program opens the node.
+- The kernel's PlayStation driver (``hid-playstation``, since Linux 5.12) binds to these ids,
+  asks for the three feature reports and makes what everything else reads: the gamepad's event
+  device, with force feedback, a battery, and event devices of their own for motion sensors
+  that never move and for the touchpad, whose click is Assistant (and since Linux 6.18 one for
+  a headset, which the pad never has). Capture is no key there: the driver keeps the microphone
+  button for itself.
+- Where that driver is missing, the kernel's generic one makes one event device out of the report
+  descriptor.
+
+Nothing here is taken from a controller. The report descriptor declares what those readers need
+of one. The layout of the input report, of the output report and of the three feature reports is
+the one the kernel's driver and SDL's read, both of which are public. What the feature reports
+say is made up to suit them: a calibration for sensors that report nothing, and a firmware new
+enough for rumble at its full range.
 """
 
 from __future__ import annotations
 
-import contextlib
-import errno
 import hashlib
-import os
-import re
 import struct
-import sys
-import threading
 import time
-from collections.abc import Callable, Mapping
-from typing import Any
 
-from stadiacast.errors import SetupError
 from stadiacast.gamepad import Button, GamepadState
-from stadiacast.uhid_gamepad import (
-    EVENT_SIZE,
-    TRIGGER_THRESHOLD,
-    UHID_CLOSE,
-    UHID_FEATURE_REPORT,
-    UHID_GET_REPORT,
-    UHID_OPEN,
-    UHID_OUTPUT,
-    UHID_OUTPUT_REPORT,
-    UHID_SET_REPORT,
-    UHID_START,
-    UHID_STOP,
-    create2_event,
-    event_type,
-    find_hidraw,
-    get_report_reply_event,
-    get_report_request,
-    hat_value,
-    input2_event,
-    open_uhid,
-    output_request,
-    set_report_reply_event,
-    set_report_request,
-    state_from_xinput,
-)
-from stadiacast.uhid_gamepad import check_available as _check_uhid_available
+from stadiacast.uhid_gamepad import TRIGGER_THRESHOLD, Requests, UhidPad, hat_value
 
+# ---- what the pad says it is -----------------------------------------------------------------
+#: A DualSense's name as the kernel has it over USB: the manufacturer and the product it states.
 PAD_NAME = "Sony Interactive Entertainment Wireless Controller"
-PAD_VENDOR, PAD_PRODUCT, PAD_VERSION = 0x054C, 0x0CE6, 0x0100
+#: Its ids, and the version of its HID interface. The kernel's driver sets the top bit of that
+#: version on the event device it makes, and programs file their mappings for a DualSense under
+#: the two numbers: 0x0111 for the generic driver's buttons and axes, 0x8111 for the PlayStation
+#: driver's. A pad that says 0x0100 comes out of that driver as 0x8100, which SDL has no mapping
+#: for: it reads the pad with the generic driver's, and buttons and sticks come out scrambled.
+PAD_VENDOR, PAD_PRODUCT, PAD_VERSION = 0x054C, 0x0CE6, 0x0111
 
-INPUT_REPORT_ID = 0x01
-INPUT_REPORT_SIZE = 64
+INPUT_REPORT_ID, INPUT_REPORT_SIZE = 0x01, 64
 OUTPUT_REPORT_ID = 0x02
-OUTPUT_REPORT_MIN_SIZE = 40  # report id + up to valid_flag2 at byte 39 (SDL writes 48 B, kernel 63 B)
+#: An output report is read up to its third byte of flags, at 39. SDL writes 48 bytes and the
+#: kernel's driver 63.
+OUTPUT_REPORT_MIN_SIZE = 40
+FEATURE_CALIBRATION, FEATURE_PAIRING, FEATURE_FIRMWARE = 0x05, 0x09, 0x20
 
-FEATURE_CALIBRATION = 0x05
-FEATURE_PAIRING_INFO = 0x09
-FEATURE_FIRMWARE_INFO = 0x20
-
-#: Inactive DualSense touch contact bit (``DS_TOUCH_POINT_INACTIVE`` in ``hid-playstation.c``).
-TOUCH_INACTIVE = 0x80
-
-_MAC_RE = re.compile(
-    r"^([0-9a-fA-F]{2}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})$"
-)
+#: The report's buttons: (byte, mask) per :class:`~stadiacast.gamepad.Button`, by position on the
+#: pad, so A is Cross and Y is Triangle. Options (``⋯``) is Create, Menu (``≡``) is Options and
+#: the Stadia button is PS. L2 and R2 are digital copies of the triggers.
+BUTTON_BITS: dict[Button, tuple[int, int]] = {
+    Button.X: (8, 0x10),  # Square
+    Button.A: (8, 0x20),  # Cross
+    Button.B: (8, 0x40),  # Circle
+    Button.Y: (8, 0x80),  # Triangle
+    Button.L1: (9, 0x01),
+    Button.R1: (9, 0x02),
+    Button.OPTIONS: (9, 0x10),  # Create
+    Button.MENU: (9, 0x20),  # Options
+    Button.L3: (9, 0x40),
+    Button.R3: (9, 0x80),
+    Button.STADIA: (10, 0x01),  # PS
+    Button.ASSISTANT: (10, 0x02),  # the touchpad's click
+    Button.CAPTURE: (10, 0x04),  # the microphone button
+}
+L2_BIT, R2_BIT = (9, 0x04), (9, 0x08)
+#: Where the report counts itself and tells its time, in thirds of a microsecond.
+SEQUENCE, TIMESTAMP = 7, 28
+#: The two touch points, whose first byte says with its top bit that no finger is there.
+TOUCH_POINTS, NO_FINGER = (33, 37), 0x80
+#: The battery: a level from 0 to 10 in the low half and how it is charged in the high half.
+STATUS, DISCHARGING, FULL = 53, 0x0, 0x2
 
 #: The report descriptor, written for what reads one. SDL and Steam take the pad for a gamepad by
 #: the collection it opens with. The kernel takes input report 1 only from a device that declares
@@ -134,11 +136,11 @@ REPORT_DESCRIPTOR = bytes(
         0x09, 0x02,  # Usage (2)
         0x95, 0x28,  # Report Count (40)
         0xB1, 0x02,  # Feature (Data, Variable, Absolute)
-        0x85, FEATURE_PAIRING_INFO,  # Report ID (9)
+        0x85, FEATURE_PAIRING,  # Report ID (9)
         0x09, 0x03,  # Usage (3)
         0x95, 0x13,  # Report Count (19)
         0xB1, 0x02,  # Feature (Data, Variable, Absolute)
-        0x85, FEATURE_FIRMWARE_INFO,  # Report ID (32)
+        0x85, FEATURE_FIRMWARE,  # Report ID (32)
         0x09, 0x04,  # Usage (4)
         0x95, 0x3F,  # Report Count (63)
         0xB1, 0x02,  # Feature (Data, Variable, Absolute)
@@ -146,6 +148,7 @@ REPORT_DESCRIPTOR = bytes(
     ]
 )  # fmt: skip
 
+# ---- the feature reports ---------------------------------------------------------------------
 #: What an ideal sensor would read: the gyroscope its whole 16 bits at the 2048 degrees a second
 #: the kernel's driver takes its range to be, the accelerometer the 8192 counts a g that both
 #: readers reckon with. Either reader then scales by what it scales by with no calibration at
@@ -156,98 +159,59 @@ GYRO_SPEED, GYRO_COUNTS, ACCEL_COUNTS = 2048, 32767, 8192
 CALIBRATION_REPORT = bytes([FEATURE_CALIBRATION]) + struct.pack(
     "<3h6h2h6h6x", 0, 0, 0, *(GYRO_COUNTS, -GYRO_COUNTS) * 3, GYRO_SPEED, GYRO_SPEED, *(ACCEL_COUNTS, -ACCEL_COUNTS) * 3
 )
-
-
-#: Synthetic feature report 0x20 (64 bytes): non-zero hardware/firmware version fields and
-#: ``update_version = 0x0224`` at bytes 44..45 so both ``hid-playstation`` (>= 0x0221) and SDL 3
-#: (>= 0x0224) select unshifted v2 rumble.
-def _build_firmware_report() -> bytes:
-    buf = bytearray(64)
-    buf[0] = FEATURE_FIRMWARE_INFO
-    struct.pack_into("<II", buf, 24, 1, 0x01000000)  # hw_version, fw_version
-    struct.pack_into("<H", buf, 44, 0x0224)  # update_version
-    return bytes(buf)
-
-
-def check_available() -> None:
-    """Fail at start-up, in plain words, where a DualSense pad could not be created later."""
-    _check_uhid_available("--gamepad dualsense")
-
-
-FIRMWARE_REPORT = _build_firmware_report()
-
-#: DualSense buttons in ``buttons[0..2]`` of input report 0x01.
-BUTTON_BITS: dict[Button, tuple[int, int]] = {
-    Button.X: (8, 0x10),  # Square (West)
-    Button.A: (8, 0x20),  # Cross (South)
-    Button.B: (8, 0x40),  # Circle (East)
-    Button.Y: (8, 0x80),  # Triangle (North)
-    Button.L1: (9, 0x01),  # L1
-    Button.R1: (9, 0x02),  # R1
-    Button.OPTIONS: (9, 0x10),  # Create (Stadia ⋯)
-    Button.MENU: (9, 0x20),  # Options (Stadia ≡)
-    Button.L3: (9, 0x40),  # L3
-    Button.R3: (9, 0x80),  # R3
-    Button.STADIA: (10, 0x01),  # PS button
-    Button.ASSISTANT: (10, 0x02),  # Touchpad click
-    Button.CAPTURE: (10, 0x04),  # Mic Mute (SDL misc1)
-}
-L2_BIT, R2_BIT = (9, 0x04), (9, 0x08)
+#: The firmware the pad says it has: the first that SDL sends rumble at the motors' whole range
+#: to (an older one gets half of every level), and past the 0x0215 from which the kernel's driver
+#: sends it the same kind of report.
+FIRMWARE_VERSION = 0x0224
+#: Feature report 32 (64 bytes): numbers of its own for the hardware and the firmware, which the
+#: kernel's driver prints, and the version above where both readers look for it.
+FIRMWARE_REPORT = bytes([FEATURE_FIRMWARE]) + struct.pack("<23xII12xH18x", 1, 0x01000000, FIRMWARE_VERSION)
 
 
 def mac_bytes(identity: str) -> bytes:
-    """A 6-byte locally-administered unicast MAC derived deterministically from ``identity``
-    (or parsed as-is when ``identity`` is already ``xx:xx:xx:xx:xx:xx``)."""
-    matched = _MAC_RE.match(identity.strip())
-    if matched:
-        return bytes(int(part, 16) for part in matched.groups())
+    """The pad's address for a controller's serial number: six bytes of its hash, marked as an
+    address that was given locally and is one device's, which no real controller's is."""
     digest = hashlib.sha256(f"stadiacast-dualsense:{identity.strip()}".encode()).digest()
     return bytes([(digest[0] & 0xFE) | 0x02, *digest[1:6]])
 
 
 def mac_string(mac: bytes) -> str:
-    """Lowercase colon-separated MAC address, as ``hid-playstation`` formats ``hdev->uniq``."""
+    """An address as the kernel's driver writes it, which is what it gives the pad for its serial."""
     if len(mac) != 6:
-        raise ValueError("MAC address must be 6 bytes")
+        raise ValueError("an address is 6 bytes")
     return ":".join(f"{b:02x}" for b in mac)
 
 
 def pairing_report(mac: bytes) -> bytes:
-    """Feature report 0x09 (20 bytes): bytes 1..6 hold the controller MAC in reverse byte order."""
+    """Feature report 9 (20 bytes): the pad's address, last byte first."""
     if len(mac) != 6:
-        raise ValueError("MAC address must be 6 bytes")
-    buf = bytearray(20)
-    buf[0] = FEATURE_PAIRING_INFO
-    buf[1:7] = mac[::-1]
-    return bytes(buf)
+        raise ValueError("an address is 6 bytes")
+    return bytes([FEATURE_PAIRING]) + mac[::-1] + bytes(13)
 
 
+# ---- the reports -----------------------------------------------------------------------------
 def stick_byte(value: int, *, invert: bool = False) -> int:
-    """A stick axis (-32768..32767, Y up) as DualSense's 0..255 byte with 128 at rest, Y down."""
+    """A stick axis (-32768..32767, Y up) as the report's byte: 0..255 with 128 at rest, Y down."""
     value = max(-32768, min(32767, value))
     if invert:
         value = -1 - value if value == -32768 else -value
     if value == 0:
         return 128
-    scaled = round((value + 32768) * 255 / 65535)
-    return max(0, min(255, scaled))
+    return max(0, min(255, round((value + 32768) * 255 / 65535)))
 
 
 def battery_byte(percent: int | None) -> int:
-    """``status[0]`` of input report 0x01: 100%/full when unknown, else discharging decile 0..10."""
+    """The battery's byte: full for a level that is not known, or else the level in tenths, on
+    the battery (whether a controller is being charged is not known)."""
     if percent is None:
-        return (0x02 << 4) | 10  # POWER_SUPPLY_STATUS_FULL, 100%
-    return min(10, max(0, int(percent) // 10))  # charging_status 0x0 = discharging
+        return (FULL << 4) | 10
+    return (DISCHARGING << 4) | min(10, max(0, int(percent) // 10))
 
 
-def input_report(
-    state: GamepadState,
-    *,
-    seq: int = 0,
-    timestamp: int = 0,
-    battery_percent: int | None = None,
-) -> bytes:
-    """64-byte DualSense USB input report (report 0x01)."""
+def input_report(state: GamepadState, battery_percent: int | None = None) -> bytes:
+    """Input report 1 for a state, as a DualSense on its cable sends it for the same controls,
+    with nobody at its touchpad and sensors at rest. :func:`stamped` adds what every report has
+    of its own."""
     data = bytearray(INPUT_REPORT_SIZE)
     data[0] = INPUT_REPORT_ID
     data[1] = stick_byte(state.lx)
@@ -256,7 +220,6 @@ def input_report(
     data[4] = stick_byte(state.ry, invert=True)
     l2, r2 = max(0, min(255, state.l2)), max(0, min(255, state.r2))
     data[5], data[6] = l2, r2
-    data[7] = seq & 0xFF
     data[8] = hat_value(state.buttons)
     for button, (index, mask) in BUTTON_BITS.items():
         if state.buttons & button:
@@ -264,334 +227,124 @@ def input_report(
     for value, (index, mask) in ((l2, L2_BIT), (r2, R2_BIT)):
         if value >= TRIGGER_THRESHOLD:
             data[index] |= mask
-    struct.pack_into("<I", data, 28, timestamp & 0xFFFFFFFF)
-    data[33] = TOUCH_INACTIVE
-    data[37] = TOUCH_INACTIVE
-    data[53] = battery_byte(battery_percent)
+    for point in TOUCH_POINTS:
+        data[point] = NO_FINGER
+    data[STATUS] = battery_byte(battery_percent)
+    return bytes(data)
+
+
+def stamped(report: bytes, sequence: int, clock: int) -> bytes:
+    """A report with its count of itself and its time."""
+    data = bytearray(report)
+    data[SEQUENCE] = sequence & 0xFF
+    struct.pack_into("<I", data, TIMESTAMP, clock & 0xFFFFFFFF)
     return bytes(data)
 
 
 def output_rumble(data: bytes) -> tuple[bool, tuple[int, int] | None]:
-    """Inspect a DualSense output report.
+    """Whether ``data`` is an output report of the pad's, and the motor levels it sets (strong,
+    weak: 0..65535), or ``None`` for one that only sets lights and the like and leaves the motors
+    as they are.
 
-    Returns ``(valid_report, levels)``, where ``levels`` is ``(strong, weak)`` in ``0..65535`` when
-    the report updates vibration and ``None`` when the report only updates LEDs/audio/triggers (so
-    ``SET_REPORT`` still succeeds without clobbering active rumble).
+    The report's flags say what it sets. Either of two says the motor levels count: bit 0 of the
+    first byte of flags, the older way, or bit 2 of the third, which the kernel's driver and SDL
+    use with the firmware this pad states. SDL stops a rumble with a report that sets neither and
+    nothing else, and asks for the motors to be the pad's haptics with bit 1 of the first byte
+    alone: both mean no rumble.
     """
     if len(data) < OUTPUT_REPORT_MIN_SIZE or data[0] != OUTPUT_REPORT_ID:
         return False, None
-    flag0, flag1, motor_right, motor_left = data[1], data[2], data[3], data[4]
-    flag2 = data[39]
-    if (flag0 & 0x01) or (flag2 & 0x04):
-        return True, (motor_left * 257, motor_right * 257)
-    if (flag0 & 0x02) or (flag0 == 0 and flag1 == 0 and flag2 == 0):
+    flags, lights, weak, strong, more = data[1], data[2], data[3], data[4], data[39]
+    if flags & 0x01 or more & 0x04:
+        return True, (strong * 257, weak * 257)
+    if flags & 0x02 or not (flags or lights or more):
         return True, (0, 0)
     return True, None
 
 
-class DualSenseRequests:
-    """Kernel event state machine for one virtual DualSense pad."""
+class DualSenseRequests(Requests):
+    """What the kernel asks of a DualSense: its three feature reports, and its output report."""
 
     def __init__(self, mac: bytes) -> None:
-        self._pairing = pairing_report(mac)
-        self.levels = (0, 0)  # strong (left), weak (right): 0..65535
-        self.starts = 0
-        self.opens = 0
+        super().__init__()
+        self._features = {
+            FEATURE_CALIBRATION: CALIBRATION_REPORT,
+            FEATURE_PAIRING: pairing_report(mac),
+            FEATURE_FIRMWARE: FIRMWARE_REPORT,
+        }
 
-    def handle(self, event: bytes) -> bytes | None:
-        kind = event_type(event)
-        if kind == UHID_GET_REPORT:
-            request, rnum, rtype = get_report_request(event)
-            if rtype == UHID_FEATURE_REPORT:
-                if rnum == FEATURE_CALIBRATION:
-                    return get_report_reply_event(request, 0, CALIBRATION_REPORT)
-                if rnum == FEATURE_PAIRING_INFO:
-                    return get_report_reply_event(request, 0, self._pairing)
-                if rnum == FEATURE_FIRMWARE_INFO:
-                    return get_report_reply_event(request, 0, FIRMWARE_REPORT)
-            return get_report_reply_event(request, errno.EINVAL)
-        if kind == UHID_OUTPUT:
-            data, rtype = output_request(event)
-            if rtype == UHID_OUTPUT_REPORT:
-                _ok, levels = output_rumble(data)
-                if levels is not None:
-                    self.levels = levels
-            return None
-        if kind == UHID_SET_REPORT:
-            request, _rnum, rtype, data = set_report_request(event)
-            if rtype != UHID_OUTPUT_REPORT:
-                return set_report_reply_event(request, errno.EIO)
-            ok, levels = output_rumble(data)
-            if not ok:
-                return set_report_reply_event(request, errno.EIO)
-            if levels is not None:
-                self.levels = levels
-            return set_report_reply_event(request, 0)
-        if kind == UHID_START:
-            self.starts += 1
-        elif kind == UHID_OPEN:
-            self.opens += 1
-        elif kind in (UHID_CLOSE, UHID_STOP):
-            self.levels = (0, 0)
-        return None
+    def output(self, data: bytes) -> bool:
+        taken, levels = output_rumble(data)
+        if levels is not None:
+            self.levels = levels
+        return taken
+
+    def feature(self, number: int) -> bytes | None:
+        return self._features.get(number)
 
 
-class DualSensePad:
-    """One virtual Sony DualSense controller with a unique MAC derived from the Stadia serial."""
+class DualSensePad(UhidPad):
+    """One virtual DualSense, whose address is its controller's alone."""
 
-    slot: int | None = None
-    takes_state = True
-    close_blocks = True
-    START_TIMEOUT = 5.0
-    #: DualSense readers expect a steady ~125 Hz stream (SDL's USB mode detection waits 16 ms for
-    #: a 64-byte packet on open).
+    FLAG = "--gamepad dualsense"
+    NAME = PAD_NAME
+    IDS = (PAD_VENDOR, PAD_PRODUCT, PAD_VERSION)
+    DESCRIPTOR = REPORT_DESCRIPTOR
+    #: A DualSense reports all the time, and a program that opens one counts on it (seconds).
     REFRESH = 0.008
-    NODE_WAIT = 1.0
-
-    label: str
     mac: bytes
-    uniq: str
-    device: str | None
-    _phys: str
-    _poll: Any
-    _requests: DualSenseRequests
-    _state: GamepadState
     _battery: int | None
-    _seq: int
-    _report_lock: threading.Lock
-    _written: float
-    _starts: int
-    _opens: int
-    _node_until: float
-    _sent: tuple[int, int]
-    _callback: Callable[[int, int], None] | None
-    _lock: threading.Lock
-    _closed: bool
-    _fd: int
-    _wake_r: int
-    _wake_w: int
-    _thread: threading.Thread
+    _sequence: int
 
     def __init__(self, label: str, uniq: str | None = None) -> None:
-        if not sys.platform.startswith("linux"):
-            raise SetupError("--gamepad dualsense is Linux only: it creates the pad through the kernel's uhid device")
-        import select
-
-        self.label = label
-        self.mac = mac_bytes((uniq or "").strip() or label)
-        self.uniq = mac_string(self.mac)
-        self.device = None
-        self._phys = f"stadiacast/{os.getpid()}/{label}"
-        self._requests = DualSenseRequests(self.mac)
-        self._state = GamepadState()
         self._battery = None
-        self._seq = 0
-        self._report_lock = threading.Lock()
-        self._written = time.monotonic()
-        self._starts = 0
-        self._opens = 0
-        self._node_until = 0.0
-        self._sent = (0, 0)
-        self._callback = None
-        self._lock = threading.Lock()
-        self._closed = False
-        self._fd = open_uhid("--gamepad dualsense")
-        self._wake_r, self._wake_w = os.pipe()
-        self._poll = select.poll()
-        self._poll.register(self._fd, select.POLLIN)
-        self._poll.register(self._wake_r, select.POLLIN)
-        try:
-            os.write(
-                self._fd,
-                create2_event(
-                    PAD_NAME,
-                    self._phys,
-                    self.uniq,
-                    REPORT_DESCRIPTOR,
-                    vendor=PAD_VENDOR,
-                    product=PAD_PRODUCT,
-                    version=PAD_VERSION,
-                ),
-            )
-            self._wait_started()
-        except SetupError:
-            self._close_files()
-            raise
-        except OSError as e:
-            self._close_files()
-            raise SetupError(f"the kernel refused the virtual pad: {e}") from e
-        self._starts = self._requests.starts
-        self._opens = self._requests.opens
-        self._emit(ignore_errors=True)
-        # Start the event thread before looking for hidraw: hid-playstation blocks its probe on
-        # GET_REPORT (0x09 MAC, 0x20 firmware, 0x05 calibration) after UHID_START and creates
-        # the hidraw node only once all three replies arrive.
-        self._thread = threading.Thread(target=self._feedback_loop, name=f"dualsense-{label}", daemon=True)
-        self._thread.start()
-        self.device = self._find_node()
+        self._sequence = 0
+        super().__init__(label, uniq)
 
-    def _wait_started(self) -> None:
-        deadline = time.monotonic() + self.START_TIMEOUT
-        while not self._requests.starts:
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise SetupError(
-                    f"the kernel did not start the virtual pad within {self.START_TIMEOUT:g} s: no HID driver"
-                    " took it (`sudo modprobe hid-playstation` or `hid-generic`)"
-                )
-            if self._poll.poll(int(left * 1000) + 1):
-                self._read_events()
+    def _identity(self, serial: str) -> str:
+        self.mac = mac_bytes(serial)
+        return mac_string(self.mac)
 
-    def _find_node(self) -> str | None:
-        deadline = time.monotonic() + self.NODE_WAIT
-        while True:
-            node = find_hidraw(self._phys)
-            if node is not None or time.monotonic() >= deadline:
-                return node
-            time.sleep(0.01)
+    def _new_requests(self) -> Requests:
+        return DualSenseRequests(self.mac)
 
-    def _close_files(self) -> None:
-        for fd in (self._fd, self._wake_r, self._wake_w):
-            with contextlib.suppress(OSError):
-                os.close(fd)
+    def _encode(self, state: GamepadState) -> bytes:
+        return input_report(state, self._battery)
 
-    # ---- input ---------------------------------------------------------------------------
+    def _stamp(self, report: bytes) -> bytes:
+        self._sequence += 1
+        return stamped(report, self._sequence, time.monotonic_ns() // 333)
+
     def set_battery(self, percent: int | None) -> None:
+        """The controller's battery level, which the pad's next report carries."""
         with self._report_lock:
             self._battery = percent
-
-    def apply_state(self, state: GamepadState) -> None:
-        with self._report_lock:
-            if state == self._state and self._seq > 0:
-                return
-            self._state = state
-            self._write_locked(ignore_errors=False)
-
-    def _emit(self, *, ignore_errors: bool) -> None:
-        with self._report_lock:
-            self._write_locked(ignore_errors=ignore_errors)
-
-    def _write_locked(self, *, ignore_errors: bool) -> None:
-        report = input_report(
-            self._state,
-            seq=self._seq,
-            timestamp=time.monotonic_ns() // 333,
-            battery_percent=self._battery,
-        )
-        self._seq = (self._seq + 1) & 0xFF
-        try:
-            os.write(self._fd, input2_event(report))
-        except OSError as e:
-            if not ignore_errors:
-                raise SetupError(f"the virtual pad no longer takes reports: {e}") from e
-        self._written = time.monotonic()
-
-    def apply(self, xinput: Mapping[str, int]) -> None:
-        self.apply_state(state_from_xinput(xinput))
-
-    def reset(self) -> None:
-        self.apply_state(GamepadState())
-
-    # ---- requests and rumble -------------------------------------------------------------
-    def on_rumble(self, callback: Callable[[int, int], None]) -> None:
-        with self._lock:
-            self._callback = callback
-            self._sent = (0, 0)
-        with contextlib.suppress(OSError):
-            os.write(self._wake_w, b"r")
-
-    def _read_events(self) -> bool:
-        while True:
-            try:
-                event = os.read(self._fd, EVENT_SIZE)
-            except BlockingIOError:
-                return True
-            except OSError:
-                return False
-            if not event:
-                return False
-            reply = self._requests.handle(event)
-            if reply is not None:
-                with contextlib.suppress(OSError):
-                    os.write(self._fd, reply)
-
-    def _feedback_loop(self) -> None:
-        while True:
-            left = self._written + self.REFRESH - time.monotonic()
-            try:
-                ready = self._poll.poll(max(0.0, left) * 1000)
-            except OSError:
-                return
-            for fd, _what in ready:
-                if fd == self._wake_r:
-                    if b"x" in os.read(fd, 16):
-                        return
-                elif not self._read_events():
-                    return
-            self._keep_up()
-            self._tell()
-
-    def _keep_up(self) -> None:
-        now = time.monotonic()
-        restarted = self._requests.starts != self._starts
-        reopened = self._requests.opens != self._opens
-        if restarted:
-            self._starts = self._requests.starts
-            self._node_until = now + self.NODE_WAIT
-        if reopened:
-            self._opens = self._requests.opens
-        if now < self._node_until:
-            node = find_hidraw(self._phys)
-            if node is not None:
-                self.device = node
-        if restarted or reopened or now - self._written >= self.REFRESH:
-            self._emit(ignore_errors=True)
-
-    def _tell(self) -> None:
-        strong, weak = self._requests.levels
-        levels = (strong >> 8, weak >> 8)
-        with self._lock:
-            callback = self._callback
-            if callback is None or levels == self._sent:
-                return
-            self._sent = levels
-        callback(*levels)
-
-    # ---- lifecycle -----------------------------------------------------------------------
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        with self._lock:
-            self._callback = None
-        with contextlib.suppress(OSError):
-            os.write(self._wake_w, b"x")
-        if self._thread is not threading.current_thread():
-            self._thread.join(2)
-        self._close_files()
+            self._report = self._encode(self._state)
 
 
 __all__ = [
     "CALIBRATION_REPORT",
     "FEATURE_CALIBRATION",
-    "FEATURE_FIRMWARE_INFO",
-    "FEATURE_PAIRING_INFO",
+    "FEATURE_FIRMWARE",
+    "FEATURE_PAIRING",
     "FIRMWARE_REPORT",
+    "FIRMWARE_VERSION",
     "INPUT_REPORT_ID",
     "INPUT_REPORT_SIZE",
     "OUTPUT_REPORT_ID",
     "PAD_NAME",
     "PAD_PRODUCT",
     "PAD_VENDOR",
+    "PAD_VERSION",
     "REPORT_DESCRIPTOR",
     "DualSensePad",
     "DualSenseRequests",
     "battery_byte",
-    "check_available",
     "input_report",
     "mac_bytes",
     "mac_string",
     "output_rumble",
     "pairing_report",
+    "stamped",
     "stick_byte",
 ]

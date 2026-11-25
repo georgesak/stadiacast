@@ -213,14 +213,25 @@ it, and it sees the programs of that user only, or everybody's as root. A device
 refuses a pad, is reported as failed (`on_error`) after two seconds. Both Linux pads are
 closed in a worker thread: the kernel takes a tenth of a second or so to remove a device.
 
-The Linux DualSense pad (`dualsense_gamepad.py`, `--gamepad dualsense`) is a second `uhid`
-backend (`054c:0ce6`) for SteamOS setups with several controllers. Steam's `sdl://` wrapper on
-Linux currently drops `HID_UNIQ` for Stadia and Xbox controllers and assigns profiles by wake
-order, whereas Steam drives a DualSense with its own HIDAPI driver and reads Feature Report
-`0x09` for a 6-byte MAC address (`configset_DS<mac>.vdf`). Each controller's serial hashes to a
-deterministic locally-administered MAC, answered on `GET_REPORT` alongside calibration (`0x05`)
-and firmware (`0x20`), while Capture maps to Mic Mute, Assistant to Touchpad click, the battery
-gauge feeds `status[0]`, and USB output report `0x02` brings rumble back.
+The Linux DualSense pad (`dualsense_gamepad.py`, `--gamepad dualsense`) is the same pad with a
+DualSense's identity and reports (`DualSensePad` is a `UhidPad`). What it is for is the
+Bluetooth address a DualSense states in feature report 9, which is how Steam knows one from
+another: the pad's is six bytes of a hash of its controller's serial number, marked as a local
+address. The kernel's PlayStation driver (`hid-playstation`) binds to the ids, asks for three
+feature reports (the address, the firmware, the sensors' calibration) and makes the gamepad's
+event device, a battery, motion sensors that never move and a touchpad whose click is
+Assistant; without that driver the generic one makes one event device of the report
+descriptor. The descriptor and the
+feature reports are written in the module for what reads them. The pad's HID version is the
+DualSense's, because the mappings programs keep for the two event devices are filed under it.
+
+SDL's DualSense driver waits 16 ms for a first report from a pad it has just opened and asks
+one that shows none for neither address nor firmware; Steam's driver for the pad is not
+public, and is taken to be no more patient. The pad therefore reports every 8 ms, each report
+with its count and its time, and writes at once when its `hidraw` node is opened. Rumble is output report 2, from a write to the `hidraw` node or from
+the kernel's driver, whose flags say whether it sets the motors or only lights. The battery
+level goes into every report: `VirtualGamepads.battery` hands it to the pad when it is made
+and when it changes.
 
 **`RtcEndpoint`** is one UDP socket and one peer. It demultiplexes datagrams (STUN / DTLS /
 RTP), runs the connectivity checks and keepalives, drives the DTLS handshake through pyOpenSSL

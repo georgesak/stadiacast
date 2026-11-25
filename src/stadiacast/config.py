@@ -92,7 +92,7 @@ class Config:
 
     # -- virtual gamepad (the input as a pad on this PC) -----------------------------------
     # off | vigem (Windows) | ojd (macOS) | uinput (Linux, Xbox 360 pad) | uhid (Linux, Stadia Controller) |
-    # dualsense (Linux, DualSense with per-controller MAC); implies StartGame for rumble
+    # dualsense (Linux, a DualSense with an address per controller); implies StartGame for rumble
     gamepad: str = "off"
     gamepad_deadzone: bool = True  # apply XInput's stick deadzones (False: raw sticks)
     gamepad_profile: str = "game-controller-compatible"  # OJD: game-controller-compatible | sdl-compatible | generic

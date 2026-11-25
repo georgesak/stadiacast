@@ -1376,6 +1376,8 @@ class ControllerSession:
         d["battery"] = round(level, 4)
         d["battery_percent"] = pct
         if changed:
+            if self.rx.gamepads is not None:
+                self.rx.gamepads.battery(self.label, pct)
             self.rx.live_changed()
         return changed
 

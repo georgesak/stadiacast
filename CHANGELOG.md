@@ -8,15 +8,15 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - A virtual DualSense controller on Linux: `--gamepad dualsense` turns each controller into a
-  USB Sony DualSense (`054c:0ce6`) through `/dev/uhid`, with a deterministic locally-administered
-  MAC address derived from the controller's serial in feature report `0x09`. Steam drives it
-  with its DualSense HIDAPI driver and stores each controller's profile under that MAC
-  (`configset_DS<mac>.vdf`), so several controllers keep their own names and bindings whatever
-  order they wake in. Capture maps to Mic Mute, Assistant to Touchpad click, the battery gauge is
-  reported, and a game's rumble comes back to the controller.
-- `--gamepad uhid` now passes each controller's serial (or device id) to `/dev/uhid` as
-  `HID_UNIQ`, and `/_status` and `gamepad_created` include `uniq` for `uhid` and `dualsense`
-  pads.
+  Sony DualSense on its cable (USB `054c:0ce6`), through the kernel's uhid device. Steam knows
+  a DualSense by the address it states, and this pad's is made from the controller's serial
+  number, so with several controllers each keeps its name and its bindings in Steam whatever
+  order they wake in. Capture is the microphone button and Assistant the click of the touchpad,
+  the controller's battery is the pad's, and a game's rumble comes back to the controller. The
+  README has the udev rules it takes.
+- The Stadia pad of `--gamepad uhid` states its controller's serial number as its own, where it
+  stated `c0`, `c1` by the order the controllers woke in: a program built on SDL 3 knows one
+  controller from another by it. `/_status` and the `gamepad_created` record name it as `uniq`.
 
 ### Changed
 - On Windows, a controller that is switched off takes its virtual pad with it, as on Linux and

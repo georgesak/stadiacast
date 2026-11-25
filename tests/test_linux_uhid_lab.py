@@ -16,6 +16,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from stadiacast import dualsense_gamepad as ds
 from stadiacast.dualsense_gamepad import DualSensePad, mac_bytes, mac_string
 from stadiacast.gamepad import Button, GamepadState
 from stadiacast.uhid_gamepad import PAD_NAME, UhidPad, input_report
@@ -360,51 +361,256 @@ def test_a_games_force_feedback_reaches_the_motors_through_the_kernels_driver(pa
         game.close()
 
 
-def test_the_kernel_takes_the_dualsense_pad_with_its_mac_and_hidraw_reports() -> None:
-    """``DualSensePad`` against the real kernel: ``hid-playstation`` (or ``hid-generic``) binds,
-    ``HID_UNIQ`` carries the deterministic MAC, 64-byte input reports arrive on ``hidraw``, and
-    output report 0x02 sets rumble."""
-    warmup = DualSensePad("lab-ds-first", "99181FFAZ00000")
+# ---- the DualSense pad -----------------------------------------------------------------------
+BTN_LEFT, BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL2, BTN_TR2 = 0x110, 0x130, 0x131, 0x133, 0x134, 0x138, 0x139
+ABS_RX, ABS_RY = 3, 4
+#: What the kernel's PlayStation driver makes of a DualSense: its gamepad's keys and axes.
+DS_KEYS = [BTN_SOUTH, BTN_EAST, BTN_NORTH, BTN_WEST, BTN_TL, BTN_TR, BTN_TL2, BTN_TR2]
+DS_KEYS += [BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR]
+DS_AXES = {ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X, ABS_HAT0Y}
+SERIAL = "99181FFAZ00123"
+
+
+@pytest.fixture(scope="module")
+def playstation_driver_loaded() -> None:
+    """As for the Stadia pad: the first DualSense after a boot is taken by the generic driver and
+    then by the kernel's PlayStation driver, once udev has loaded it. Let that pass."""
+    first = DualSensePad("lab-ds-first", "99181FFAZ00000")
     try:
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not (warmup.device and _driver(warmup.device) == "playstation"):
+        deadline = time.monotonic() + 2  # a kernel without the driver keeps the generic one
+        while time.monotonic() < deadline and not (first.device and _driver(first.device) == "playstation"):
             time.sleep(0.05)
     finally:
-        warmup.close()
+        first.close()
 
-    want_mac = mac_string(mac_bytes("99181FFAZ00123"))
-    pad = DualSensePad("lab-ds", "99181FFAZ00123")
+
+@pytest.fixture
+def dualsense(playstation_driver_loaded: None) -> Iterator[DualSensePad]:  # noqa: ARG001 (the driver, loaded first)
+    made = DualSensePad("lab-ds", SERIAL)
     try:
-        wait_until(lambda: pad.device is not None and os.path.exists(pad.device))
-        assert pad.device is not None
-        assert f"HID_UNIQ={want_mac}" in _uevent(pad.device)
-        assert _driver(pad.device) in ("playstation", "hid-generic")
-        levels: list[tuple[int, int]] = []
-        pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
-        raw = _open_hidraw(pad.device)
+        wait_until(lambda: made.device is not None and os.path.exists(made.device))
+        yield made
+    finally:
+        made.close()
+
+
+def _input_devices(hidraw: str) -> dict[str, str]:
+    """The event nodes of the HID device behind a hidraw node, by the name of their input device.
+    The kernel's driver makes them one after the other while it takes the pad, a moment after the
+    hidraw node is there: one that is only half made is not listed yet."""
+    found: dict[str, str] = {}
+    for path in glob.glob(f"/sys/class/hidraw/{os.path.basename(hidraw)}/device/input/input*"):
         try:
-            pad.set_battery(75)
-            pad.apply_state(GamepadState(buttons=int(Button.CAPTURE | Button.ASSISTANT | Button.A)))
-            matched: list[bytes] = []
+            with open(os.path.join(path, "name"), encoding="utf-8") as f:
+                name = f.read().strip()
+        except OSError:
+            continue
+        for event in glob.glob(os.path.join(path, "event*")):
+            node = f"/dev/input/{os.path.basename(event)}"
+            if os.path.exists(node):
+                found[name] = node
+    return found
 
-            def got_pressed() -> bool:
-                while True:
-                    try:
-                        pkt = os.read(raw, 128)
-                    except BlockingIOError:
-                        return bool(matched)
-                    if len(pkt) == 64 and pkt[0] == 0x01 and (pkt[8] & 0x20) and (pkt[10] & 0x06) == 0x06:
-                        matched.append(pkt)
-                        return True
 
-            wait_until(got_pressed)
-            assert matched[-1][53] == 7
-            out = bytearray(48)
-            out[0], out[1], out[3], out[4] = 0x02, 0x03, 0x40, 0x80
-            assert os.write(raw, bytes(out)) == 48
-            wait_until(lambda: (0x80, 0x40) in levels)
+def _gamepad(pad: DualSensePad) -> Game:
+    """The pad's gamepad as a game holds it, once the kernel has made it."""
+    assert pad.device is not None
+    wait_until(lambda: ds.PAD_NAME in _input_devices(pad.device or ""))
+    return Game(_input_devices(pad.device)[ds.PAD_NAME])
+
+
+def _battery(pad: DualSensePad) -> tuple[str, str] | None:
+    """What the system says of the pad's battery, its state and its level, once it has one."""
+    assert pad.device is not None
+    read: list[str] = []
+    try:
+        (supply,) = glob.glob(f"/sys/class/hidraw/{os.path.basename(pad.device)}/device/power_supply/*")
+        for field in ("status", "capacity"):
+            with open(os.path.join(supply, field), encoding="utf-8") as f:
+                read.append(f.read().strip())
+    except (OSError, ValueError, TypeError):
+        # Not there yet, or there and still being registered: the kernel then answers "try again",
+        # which Python's text layer makes a TypeError of.
+        return None
+    return read[0], read[1]
+
+
+def _effects(*, flags: int = 0, more: int = 0, strong: int = 0, weak: int = 0) -> bytes:
+    """An output report as SDL writes it to the hidraw node: 48 bytes."""
+    data = bytearray(48)
+    data[0], data[1], data[3], data[4], data[39] = 0x02, flags, weak, strong, more
+    return bytes(data)
+
+
+def test_the_kernel_takes_the_pad_for_a_dualsense(dualsense: DualSensePad) -> None:
+    """The ids, the address the pad is known by, and where the kernel has its PlayStation driver
+    what that makes of the pad: the gamepad with a DualSense's keys and axes under the version
+    programs know that driver's layout by, a battery, and the two devices beside it."""
+    assert dualsense.device is not None
+    address = mac_string(mac_bytes(SERIAL))
+    assert dualsense.uniq == address and f"HID_UNIQ={address}" in _uevent(dualsense.device)
+    driver = _driver(dualsense.device)
+    assert driver in ("playstation", "hid-generic")
+    game = _gamepad(dualsense)
+    try:
+        assert game.name() == ds.PAD_NAME
+        if driver == "hid-generic":
+            assert game.identity() == (0x03, 0x054C, 0x0CE6, 0x0111)
+            return
+        assert game.identity() == (0x03, 0x054C, 0x0CE6, 0x8111)
+        assert sorted(game.codes(EV_KEY)) == DS_KEYS and game.codes(EV_ABS) == DS_AXES
+        assert EV_FF in game.codes(0)
+    finally:
+        game.close()
+    # and since Linux 6.18 one more, for a headset in the pad's jack
+    devices = {ds.PAD_NAME, f"{ds.PAD_NAME} Motion Sensors", f"{ds.PAD_NAME} Touchpad"}
+    wait_until(lambda: set(_input_devices(dualsense.device or "")) >= devices)
+    wait_until(lambda: _battery(dualsense) == ("Full", "100"))  # not known yet
+    dualsense.set_battery(76)
+    wait_until(lambda: _battery(dualsense) == ("Discharging", "75"))  # the middle of its tenth
+
+
+def test_every_control_is_what_the_kernels_driver_makes_of_a_dualsenses(dualsense: DualSensePad) -> None:
+    """Each control alone, read from the gamepad the kernel's driver makes: what SDL 2, browsers
+    and the rest read. Capture, the microphone button, is no key there, and Assistant is the
+    click of the touchpad, a device of its own."""
+    assert dualsense.device is not None
+    if _driver(dualsense.device) != "playstation":
+        pytest.skip("hid-playstation did not take the pad (not built, or not loaded)")
+    game = _gamepad(dualsense)
+    try:
+        wait_until(lambda: game.axis(ABS_X)[0] == 128)
+        assert [game.axis(axis)[0] for axis in (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ)] == [128] * 4 + [0, 0]
+        assert not game.held() & set(DS_KEYS)
+        keys = {
+            Button.A: BTN_SOUTH,
+            Button.B: BTN_EAST,
+            Button.X: BTN_WEST,
+            Button.Y: BTN_NORTH,
+            Button.L1: BTN_TL,
+            Button.R1: BTN_TR,
+            Button.OPTIONS: BTN_SELECT,
+            Button.MENU: BTN_START,
+            Button.STADIA: BTN_MODE,
+            Button.L3: BTN_THUMBL,
+            Button.R3: BTN_THUMBR,
+        }
+        for button, key in keys.items():
+            dualsense.apply_state(GamepadState(buttons=int(button)))
+            wait_until(lambda key=key: game.held() & set(DS_KEYS) == {key})
+        for button in (Button.CAPTURE, Button.ASSISTANT):
+            dualsense.apply_state(GamepadState(buttons=int(button)))
+            wait_until(lambda: not game.held() & set(DS_KEYS))
+        hats = {Button.DPAD_UP: (0, -1), Button.DPAD_DOWN: (0, 1), Button.DPAD_LEFT: (-1, 0), Button.DPAD_RIGHT: (1, 0)}
+        for button, hat in hats.items():
+            dualsense.apply_state(GamepadState(buttons=int(button)))
+            wait_until(lambda hat=hat: (game.axis(ABS_HAT0X)[0], game.axis(ABS_HAT0Y)[0]) == hat)
+        dualsense.apply_state(GamepadState(lx=32767, ly=32767, rx=-32768, ry=-32768, l2=255, r2=40))
+        wait_until(lambda: game.axis(ABS_Z)[0] == 255)
+        sticks = [game.axis(axis)[0] for axis in (ABS_X, ABS_Y, ABS_RX, ABS_RY, ABS_Z, ABS_RZ)]
+        assert sticks == [255, 0, 0, 255, 255, 40] and game.held() & set(DS_KEYS) == {BTN_TL2, BTN_TR2}
+        dualsense.apply_state(GamepadState())
+    finally:
+        game.close()
+    wait_until(lambda: f"{ds.PAD_NAME} Touchpad" in _input_devices(dualsense.device or ""))
+    try:
+        touchpad = Game(_input_devices(dualsense.device)[f"{ds.PAD_NAME} Touchpad"])
+    except PermissionError:
+        return  # a touchpad is the desktop's to read: not this user's, without a rule for it
+    try:
+        dualsense.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))
+        wait_until(lambda: BTN_LEFT in touchpad.held())
+        dualsense.apply_state(GamepadState())
+        wait_until(lambda: BTN_LEFT not in touchpad.held())
+    finally:
+        touchpad.close()
+
+
+def test_a_program_that_opens_the_dualsense_is_given_its_report_at_once(dualsense: DualSensePad) -> None:
+    """What SDL's driver does with a DualSense it has just opened: it waits 16 ms for
+    a 64-byte report, and reads neither the address nor the firmware of a pad that shows none.
+    The pad reports all the time and at once when the node is opened, so the report is there
+    well within that."""
+    import select
+
+    assert dualsense.device is not None
+    dualsense.set_battery(76)
+    dualsense.apply_state(GamepadState(buttons=int(Button.CAPTURE | Button.ASSISTANT | Button.A)))
+    waits: list[float] = []
+    for _ in range(20):
+        raw = _open_hidraw(dualsense.device)
+        try:
+            began = time.monotonic()
+            ready, _, _ = select.select([raw], [], [], 1.0)
+            waits.append(time.monotonic() - began)
+            assert ready
+            report = os.read(raw, 128)
+            assert len(report) == 64 and report[0] == 0x01
+            assert report[8] & 0x20 and report[10] & 0x06 == 0x06 and report[53] == 7
         finally:
             os.close(raw)
+        time.sleep(0.07)  # past the hurry that an open sets off: the next open finds the pad at its own pace
+    # all but a few: a machine that is busy with something else may keep any thread waiting
+    assert sorted(waits)[-6] < 0.016, f"a report took {max(waits) * 1000:.1f} ms to come: {sorted(waits)[-8:]}"
+
+
+def test_a_dualsenses_rumble_reaches_the_motors_and_stops_with_the_program_that_left_it_on(
+    dualsense: DualSensePad,
+) -> None:
+    """Rumble as SDL writes it to the hidraw node, the way the pad's firmware version asks for.
+    A program that ends while its rumble runs is not there to stop it, and the kernel's driver,
+    which holds the device open for itself, never says that the last program closed it."""
+    assert dualsense.device is not None
+    levels: list[tuple[int, int]] = []
+    dualsense.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    raw = _open_hidraw(dualsense.device)
+    try:
+        assert os.write(raw, _effects(flags=0x02, more=0x04, strong=0x80, weak=0x40)) == 48
+        wait_until(lambda: (0x80, 0x40) in levels)
+        os.write(raw, _effects())  # SDL's stop
+        wait_until(lambda: levels[-1] == (0, 0))
+        os.write(raw, _effects(flags=0x02, more=0x04, strong=0xFF, weak=0x10))
+        wait_until(lambda: levels[-1] == (0xFF, 0x10))
+    finally:
+        os.close(raw)  # as a program that is killed lets go of it
+    wait_until(lambda: levels[-1] == (0, 0))
+
+
+def test_a_games_force_feedback_reaches_the_motors_through_the_playstation_driver(dualsense: DualSensePad) -> None:
+    """A game that rumbles through the gamepad's event node: hid-playstation turns the effect into
+    the pad's output report."""
+    assert dualsense.device is not None
+    if _driver(dualsense.device) != "playstation":
+        pytest.skip("hid-playstation did not take the pad (not built, or not loaded)")
+    levels: list[tuple[int, int]] = []
+    dualsense.on_rumble(lambda strong, weak: levels.append((strong, weak)))
+    game = _gamepad(dualsense)
+    try:
+        slot = game.upload(0x8000, 0x4000, 0)
+        game.play(slot)
+        wait_until(lambda: (0x80, 0x40) in levels)
+        game.play(slot, 0)
         wait_until(lambda: levels[-1] == (0, 0))
     finally:
-        pad.close()
+        game.close()
+
+
+def test_a_second_pad_with_the_same_address_is_refused_by_the_kernel_and_says_so(
+    dualsense: DualSensePad, monkeypatch
+) -> None:
+    """The kernel's driver has one DualSense per address. A second pad of the same controller,
+    another receiver's for instance, is started and then let go of, and no driver takes it."""
+    assert dualsense.device is not None
+    if _driver(dualsense.device) != "playstation":
+        pytest.skip("hid-playstation did not take the pad (not built, or not loaded)")
+    wait_until(lambda: _battery(dualsense) is not None)  # the driver has taken the first for good
+    monkeypatch.setattr(DualSensePad, "DRIVER_WAIT", 0.3)
+    second = DualSensePad("lab-ds-again", SERIAL)
+    told: list[str] = []
+    try:
+        second.on_error(told.append)
+        wait_until(lambda: bool(told))
+        assert "no other took it" in told[0]
+    finally:
+        second.close()
+    assert _driver(dualsense.device) == "playstation"  # the first is as it was

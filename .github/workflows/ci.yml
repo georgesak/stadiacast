@@ -33,8 +33,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           # No login session with a seat here, so the rules name a mode instead of the tag the
-          # README gives a person at the computer. The Stadia pad's tests skip where the kernel
-          # has no uhid.
+          # README gives a person at the computer. The Stadia and DualSense pads' tests skip where
+          # the kernel has no uhid.
           {
             echo 'KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0666", OPTIONS+="static_node=uinput"'
             echo 'KERNEL=="uhid", SUBSYSTEM=="misc", MODE="0666", OPTIONS+="static_node=uhid"'

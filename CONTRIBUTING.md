@@ -33,8 +33,8 @@ workflow runs the suite, the Windows-only drivers and the Windows executables on
 runner, and the manual Linux lab workflow the Linux pads against a real kernel. On a Linux
 machine of your own, `STADIACAST_LINUX_LAB=1 uv run pytest tests/test_linux_lab.py
 tests/test_linux_uhid_lab.py` does the same, as a user who may open `/dev/uinput` and, for the
-Stadia pad, `/dev/uhid` and the pad's `hidraw` node: a pad appears on the system while it runs,
-and A, the left stick and the left trigger are what it presses.
+Stadia pad and the DualSense pad, `/dev/uhid` and the pads' `hidraw` nodes: a pad appears on the
+system while it runs, and A, the left stick and the left trigger are what it presses.
 
 ## Tests
 
