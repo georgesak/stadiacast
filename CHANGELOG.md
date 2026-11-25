@@ -9,6 +9,10 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - On Windows, ViGEm gamepads are now removed upon controller disconnect when using the `--gamepad vigem` argument. https://github.com/jkfran/stadiacast/issues/13
 
+### Fixed
+- On Windows, two controllers that connect at the same moment are no longer both listed as
+  the same XInput player in `/_status`.
+
 ## [1.3.0] - 2026-11-18
 
 The controller's microphone on the computer: a microphone that a voice chat or any other

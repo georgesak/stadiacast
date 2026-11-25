@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -155,23 +156,43 @@ def wait_until_plugged_in(
 class ViGEmPad:
     """One ViGEm Xbox 360 pad. Create it off the event loop: the wake-up dance sleeps."""
 
+    #: How long XInput may take to show a new pad's player (seconds); it is there within a few
+    #: hundredths of a second.
+    PLAYER_WAIT = 2.0
+    #: One pad is plugged in at a time. A pad learns its XInput player from which one appeared
+    #: since it looked, and two controllers that wake together would each take the lower of the
+    #: two new players for its own.
+    _plugging = threading.Lock()
+
     def __init__(self, label: str, *, settle: bool = True) -> None:
         import vgamepad as vg  # Windows only; the import itself fails elsewhere
 
         self.label = label
         self._buttons = {bit: getattr(vg.XUSB_BUTTON, name) for bit, name in BUTTON_BITS.items()}
-        before = occupied_xinput_slots()
-        self.pad: Any = vg.VX360Gamepad()
         self.mask = 0
         self.slot: int | None = None
-        wait_until_plugged_in(self.pad.update)
+        with self._plugging:
+            before = occupied_xinput_slots()
+            self.pad: Any = vg.VX360Gamepad()
+            wait_until_plugged_in(self.pad.update)
+            if settle:
+                self.slot = self._player(before)
         if settle:
-            self._settle(before)
+            self._settle()
 
-    def _settle(self, before: set[int]) -> None:
-        # XInput enumerates a fresh ViGEm target only after a short delay, and until a report
-        # changes something the pad exposes uninitialised stick values (a constant phantom drift):
-        # alternate a tiny deflection with a neutral report, then leave it neutral.
+    def _player(self, before: set[int]) -> int | None:
+        """The XInput player this pad landed on: the one that appeared since ``before``."""
+        deadline = time.monotonic() + self.PLAYER_WAIT
+        while True:
+            new = occupied_xinput_slots() - before
+            if new or time.monotonic() >= deadline:
+                return min(new, default=None)
+            time.sleep(0.02)
+
+    def _settle(self) -> None:
+        # Until a report changes something, a fresh pad exposes uninitialised stick values (a
+        # constant phantom drift), and XInput takes a moment to follow a new one: alternate a
+        # tiny deflection with a neutral report, then leave it neutral.
         time.sleep(1.0)
         for i in range(6):
             if i % 2:
@@ -183,12 +204,6 @@ class ViGEmPad:
         self.pad.reset()
         self.pad.update()
         time.sleep(0.2)
-        for _ in range(20):  # the XInput player this pad landed on: whatever appeared since `before`
-            new = occupied_xinput_slots() - before
-            if new:
-                self.slot = min(new)
-                return
-            time.sleep(0.1)
 
     def apply(self, xinput: dict[str, int]) -> None:
         w = xinput["wButtons"]

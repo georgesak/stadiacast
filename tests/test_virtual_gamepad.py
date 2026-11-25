@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import sys
 import threading
-from typing import ClassVar
+import time
+import types
+from typing import Any, ClassVar
 
 import pytest
 
+from stadiacast import virtual_gamepad
 from stadiacast.config import Config
 from stadiacast.errors import SetupError
 from stadiacast.gamepad import Button, GamepadState
@@ -19,6 +22,7 @@ from stadiacast.virtual_gamepad import (
     BUTTON_BITS,
     MOTOR_SCALE,
     PENDING_TRANSITIONS,
+    ViGEmPad,
     VirtualGamepads,
     wait_until_plugged_in,
 )
@@ -614,3 +618,109 @@ def test_a_pad_whose_close_waits_is_closed_off_the_event_loop(tmp_path) -> None:
             let_go.set()
 
     asyncio.run(run())
+
+
+class _FakeViGEm:
+    """ViGEm and XInput as far as the pad uses them: a target takes the lowest free XInput player a
+    moment after it is added, and gives it back when the last reference to it goes, which is how
+    vgamepad removes one."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._players: dict[int, float] = {}  # player -> when XInput shows it (no reference to its target)
+        bus = self
+
+        class Target:
+            def __init__(self) -> None:
+                self.reports: list[tuple[int, tuple[int, int]]] = []
+                self.buttons = 0
+                self.stick = (0, 0)
+                self.notified = False
+                with bus._lock:
+                    self.player = min(set(range(4)) - set(bus._players))
+                    bus._players[self.player] = time.monotonic() + 0.03
+
+            def __del__(self) -> None:
+                with bus._lock:
+                    bus._players.pop(self.player, None)
+
+            def update(self) -> None:
+                self.reports.append((self.buttons, self.stick))
+
+            def reset(self) -> None:
+                self.buttons, self.stick = 0, (0, 0)
+
+            def press_button(self, button: int) -> None:
+                self.buttons |= button
+
+            def release_button(self, button: int) -> None:
+                self.buttons &= ~button
+
+            def left_joystick(self, x_value: int, y_value: int) -> None:
+                self.stick = (x_value, y_value)
+
+            def right_joystick(self, x_value: int, y_value: int) -> None:
+                pass
+
+            def left_trigger(self, value: int) -> None:
+                pass
+
+            def right_trigger(self, value: int) -> None:
+                pass
+
+            def register_notification(self, callback_function: Any) -> None:
+                self.notified = callback_function is not None
+
+            def unregister_notification(self) -> None:
+                self.notified = False
+
+        self.module = types.ModuleType("vgamepad")
+        self.module.VX360Gamepad = Target  # type: ignore[attr-defined]
+        self.module.XUSB_BUTTON = types.SimpleNamespace(**{name: 1 << bit for bit, name in BUTTON_BITS.items()})  # type: ignore[attr-defined]
+
+    def players(self) -> set[int]:
+        now = time.monotonic()
+        with self._lock:
+            return {player for player, shown in self._players.items() if shown <= now}
+
+
+@pytest.fixture
+def vigem(monkeypatch) -> _FakeViGEm:
+    fake_vigem = _FakeViGEm()
+    monkeypatch.setitem(sys.modules, "vgamepad", fake_vigem.module)
+    monkeypatch.setattr(virtual_gamepad, "occupied_xinput_slots", fake_vigem.players)
+    monkeypatch.setattr(ViGEmPad, "_settle", lambda _self: None)  # the stick dance: three seconds
+    return fake_vigem
+
+
+def test_two_vigem_pads_made_at_once_learn_their_own_players(vigem) -> None:
+    """A pad knows its XInput player by which one appeared since it looked. Two controllers that
+    wake together have their pads made in two threads: each must find its own player, not the
+    lower of the two new ones."""
+    made: list[ViGEmPad] = []
+    threads = [threading.Thread(target=lambda n=n: made.append(ViGEmPad(f"c{n}"))) for n in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    try:
+        assert sorted(pad.slot for pad in made if pad.slot is not None) == [0, 1]
+        assert all(pad.pad.player == pad.slot for pad in made)
+    finally:
+        for pad in made:
+            pad.close()
+    assert vigem.players() == set()
+
+
+@pytest.mark.usefixtures("vigem")
+def test_a_vigem_pad_xinput_never_shows_has_no_player(monkeypatch) -> None:
+    """XInput has four players. A fifth pad is plugged in and works for a game that reads it
+    another way; it has no player to name, and says so after a short wait."""
+    monkeypatch.setattr(ViGEmPad, "PLAYER_WAIT", 0.05)
+    monkeypatch.setattr(virtual_gamepad, "occupied_xinput_slots", lambda: set())
+    began = time.monotonic()
+    pad = ViGEmPad("c0")
+    try:
+        assert pad.slot is None and time.monotonic() - began < 2
+    finally:
+        pad.close()
