@@ -170,13 +170,19 @@ keeps them in `/_status`.
   manufacturer (`Google, Inc.`), `f14` the product and region code (`GA00722-GB`), `f15` the
   hardware build (`gotham_pvt_3`), `f16` the firmware build (`282115`), `f17` the serial
   number (the one the Omaha request carries too), `f4` whether a plug is in the headset jack
-  at that moment, and `device_info`, the sub-table below. The receiver logs them once as
+  at that moment, `f10` the battery level at that moment, and `device_info`, the sub-table
+  below. `f10` is 32 bits that are a float, the charge as a fraction: in ten connections of a
+  controller on 282115 it read one percent above the gauge's first sample that followed
+  (0.64, then 0.63), and a user's two controllers on 316382 gave the same within a percent
+  either way, 1.0 on a full battery. The receiver logs the fields once as
   `controller_hardware` when the link reaches READY, and falls back to `f17` for the serial
   when no `controller-device-id` header came.
 - **The battery gauge, `ControllerToDisplay` #10** (`notification10`, a float): the charge as a
-  fraction. The first sample comes a few minutes after READY, then one step down per percent
-  (0.76, 0.75, 0.74, ... every few minutes on a live controller) and never up while it runs
-  on the battery. `/_status` shows it as `battery_percent`; every change is a
+  fraction. The first sample comes half a minute to a few minutes after READY, then one for
+  every percent the level moves by (0.76, 0.75, 0.74, ... every few minutes on a live
+  controller that runs on its battery; a user's controllers on a charger step upwards), and
+  none while the level holds, so none at all on a full battery. `/_status` shows the level as
+  `battery_percent`, from `f10` above until the gauge speaks; every change by the gauge is a
   `controller_battery` event.
 - **The audio configuration, `ControllerToDisplay` #4** (`audio_configuration_changed`): sent
   within a second of the headset going in (`mode` 1) or out (`mode` 0); `/_status` shows it

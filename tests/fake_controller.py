@@ -39,6 +39,7 @@ import asyncio
 import ipaddress
 import secrets
 import ssl
+import struct
 import sys
 import time
 import zlib
@@ -163,6 +164,7 @@ class FakeController:
         self._mic_seq = 0
         self._mic_ts = 0x1000
         self.headset_plugged = False  # GetControllerStateResponse.f4
+        self.battery_level: float | None = 0.8  # GetControllerStateResponse.f10, a float's bits; None leaves it out
         self.serial_number = "FAKESERIAL0001"  # GetControllerStateResponse.f17
         self.start_game_requests: list[dict] = []  # DisplayToController #8 StartGame {ticket, key, number}
         self._start_game_held: int | None = None  # ticket whose reply waits for GAME_STARTED / GAME_STOPPED
@@ -252,6 +254,8 @@ class FakeController:
         cs = reply.controller_state
         cs.device_id = self.device_id
         cs.f4 = self.headset_plugged
+        if self.battery_level is not None:
+            (cs.f10,) = struct.unpack("<I", struct.pack("<f", self.battery_level))
         cs.f12, cs.f14, cs.f15 = "Google, Inc.", "GA00722-FAKE", "gotham_pvt_3"
         cs.f16, cs.f17 = "282115", self.serial_number
         cs.f20 = 1

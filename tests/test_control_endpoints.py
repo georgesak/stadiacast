@@ -201,7 +201,7 @@ def test_input_is_what_each_controller_is_doing_right_now(tmp_path):
             assert (await fc.keepalive())["code"] == 0
             c0 = (await get_json(port, "/_input"))[1]["controllers"]["c0"]
             assert (c0["display_state"], c0["ip"], c0["input"], c0["gamepad"]) == ("ready", "127.0.0.1", None, None)
-            assert (c0["battery_percent"], c0["headset"]) == (None, False) and 0 <= c0["last_seen_s"] < 1
+            assert (c0["battery_percent"], c0["headset"]) == (80, False) and 0 <= c0["last_seen_s"] < 1
 
             assert fc.send_input_rpc(buttons=(1 << 12) | (1 << 9), lx=-1234, ly=77, rt=200)
             assert fc.send_battery(0.76)

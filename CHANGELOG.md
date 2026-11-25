@@ -27,6 +27,10 @@ All notable changes to this project are documented here. The format follows
   system, instead of from its first input: a game finds a controller that is switched on, and
   the first press does not wait for the pad, which takes about three seconds to make on
   Windows.
+- A controller's battery level is known as soon as it has connected: `/_status`, `/_input`
+  and the `controller_hardware` record have it from the controller's own state, where
+  `battery_percent` stayed empty until the gauge first reported, minutes later or, on a full
+  battery, never.
 
 ### Fixed
 - On Windows, two controllers that connect at the same moment are no longer both listed as

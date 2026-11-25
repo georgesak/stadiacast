@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
+import struct
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -67,6 +69,15 @@ def _as_bool(v: Any) -> bool | None:
     return None if v is None else bool(v)
 
 
+def _as_level(v: Any) -> float | None:
+    """A 32-bit field read as the float its bits are, when that is a level from 0 to 1: the
+    battery's in ``GetControllerStateResponse``, which the schema has as a plain fixed32."""
+    if not isinstance(v, int) or not 0 <= v <= 0xFFFFFFFF:
+        return None
+    (level,) = struct.unpack("<f", struct.pack("<I", v))
+    return level if math.isfinite(level) and 0.0 <= level <= 1.0 else None
+
+
 def _fresh_display_session() -> dict[str, Any]:
     return {
         "state": "idle",
@@ -82,8 +93,8 @@ def _fresh_display_session() -> dict[str, Any]:
         "keepalive_replies": 0,
         "wire_in": {},
         "input_rpc": 0,
-        # What the controller reports about itself (protocol.md §5): the battery gauge (#10)
-        # and the audio configuration (#4, the headset going in or out).
+        # What the controller reports about itself (protocol.md §5): the battery level (in its
+        # state, then the gauge, #10) and the audio configuration (#4, the headset going in or out).
         "battery": None,
         "battery_percent": None,
         "battery_samples": 0,
@@ -1296,12 +1307,16 @@ class ControllerSession:
                 self.rx.live_changed()
             if not self.serial and isinstance(state.get("f17"), str) and state["f17"].strip():
                 self.serial = state["f17"].strip()  # f17 is the serial too, for when the header never came
+            level = _as_level(state.get("f10"))  # the battery now: the gauge's first word comes minutes later
+            if level is not None:
+                self._set_battery(level)
             self.log(
                 "display_controller_state",
                 code=rpc.get("code"),
                 device_id=state.get("device_id"),
                 n_fields=len(state),
                 headset=headset,
+                battery_percent=d["battery_percent"],
                 controller_state=state,
             )
             self._set_display_state("controller-state-received")
@@ -1321,8 +1336,8 @@ class ControllerSession:
     def _log_hardware_summary(self) -> None:
         """One line at READY with the controller's self-description (GetControllerStateResponse).
 
-        The battery gauge arrives on its own a few minutes later (``controller_battery``), so it
-        is usually still unknown here.
+        The battery level is the one its state gave; the gauge (``controller_battery``) follows
+        it from a few minutes later on.
         """
         d = self.session["display"]
         state = d.get("controller_state") or {}
@@ -1340,20 +1355,29 @@ class ControllerSession:
     def _on_battery(self, m: Any) -> None:
         """``ControllerToDisplay`` #10: the charge level as a fraction, 0.0 to 1.0.
 
-        The first sample comes a few minutes after READY, then one step down per percent (0.76,
-        0.75, 0.74 ... every few minutes on a live controller) and never up while it runs on the
-        battery.
+        The first sample comes a few minutes after READY, then one for every percent the level
+        moves by (0.76, 0.75, 0.74 ... every few minutes on a live controller that runs on its
+        battery), and none while it holds. Until the first, the level is the one the controller's
+        state gave when it connected.
         """
         d = self.session["display"]
         level = max(0.0, min(1.0, float(m.value)))
+        changed = self._set_battery(level)
+        d["battery_samples"] += 1
+        pct = d["battery_percent"]
+        self.log("controller_battery", _quiet=not changed, percent=pct, level=round(level, 4), n=d["battery_samples"])
+
+    def _set_battery(self, level: float) -> bool:
+        """Note the battery level, for ``/_status`` and for a virtual pad that shows one; whether
+        its percentage changed."""
+        d = self.session["display"]
         pct = round(level * 100)
-        changed = d["battery_percent"] != pct
+        changed: bool = d["battery_percent"] != pct
         d["battery"] = round(level, 4)
         d["battery_percent"] = pct
-        d["battery_samples"] += 1
-        self.log("controller_battery", _quiet=not changed, percent=pct, level=round(level, 4), n=d["battery_samples"])
         if changed:
             self.rx.live_changed()
+        return changed
 
     def _on_audio_config(self, m: Any) -> None:
         """``ControllerToDisplay`` #4: the audio configuration changed, which means the headset moved.
