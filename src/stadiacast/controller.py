@@ -1115,6 +1115,8 @@ class ControllerSession:
             if state == "ready":
                 self._log_hardware_summary()
             if DISPLAY_STATES.index(state) >= DISPLAY_STATES.index("ready"):
+                if self.rx.gamepads is not None:
+                    self.rx.gamepads.prepare(self.label)  # the pad is there before the first press needs it
                 self.game.maybe_start()
                 self._maybe_start_audio()
                 if self.rx.mic_device is not None:

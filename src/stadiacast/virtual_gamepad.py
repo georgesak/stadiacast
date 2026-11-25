@@ -6,15 +6,18 @@ forwards the game's rumble back to the controller through the game session, whic
 switches on once the link is READY (rumble has no other path). The reports come from the
 display link and, once a game runs, from the game session; both read into the same
 :class:`~stadiacast.gamepad.GamepadState`. Two controllers are XInput players 1 and 2, each fed
-only by its own reports. A pad that cannot be created shows its error in ``/_status`` and is
-tried again on the controller's next report after it reboots.
+only by its own reports.
+
+A pad is there for as long as its controller is: it is made when the controller's link is READY
+and removed when the controller goes away, as a wireless pad is when it is switched off. One that
+cannot be created shows its error in ``/_status`` and is tried again when the controller boots
+again.
 
 ``--gamepad ojd`` is the same on macOS, where the pad is a feed process of the OpenJoystickDriver
-app (:mod:`stadiacast.ojd_gamepad`) and is closed when its controller goes away.
+app (:mod:`stadiacast.ojd_gamepad`).
 
 ``--gamepad uinput`` is the same on Linux, where the pad is an input device the receiver creates
-through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`). It is removed when its controller
-goes away, as a wireless pad is when it is switched off.
+through the kernel's uinput (:mod:`stadiacast.uinput_gamepad`).
 
 ``--gamepad uhid`` is the Linux pad as a wired Stadia Controller instead of an Xbox 360 pad: a HID
 device the receiver creates through the kernel's uhid (:mod:`stadiacast.uhid_gamepad`), which a
@@ -86,8 +89,6 @@ class PadBackend(Protocol):
     slot: int | None
 
     def apply(self, xinput: dict[str, int]) -> None: ...
-
-    def reset(self) -> None: ...
 
     def on_rumble(self, callback: Callable[[int, int], None]) -> None: ...
 
@@ -243,7 +244,9 @@ class ViGEmPad:
 
 
 class VirtualGamepads:
-    """The receiver's gamepad output: one pad per controller label, created on the first report."""
+    """The receiver's gamepad output: one pad per controller label, for as long as the controller
+    is there. A pad lives for one boot of its controller: :meth:`prepare` makes it when the link is
+    READY and :meth:`release` removes it when the controller reboots or goes away."""
 
     def __init__(
         self,
@@ -253,18 +256,14 @@ class VirtualGamepads:
         backend_factory: Callable[[str], PadBackend],
         *,
         kind: str = "vigem",
-        per_boot: bool = False,
     ) -> None:
         self.cfg = cfg
         self.log = log
         self.rx = rx
         self.kind = kind
-        #: A pad lives for one boot of its controller and is closed when the controller goes away
-        #: (an OJD feed is one of four, a Linux pad is made in no time), where a ViGEm pad, which
-        #: takes seconds to create, stays and is only let go of.
-        self._per_boot = per_boot
         self._factory = backend_factory
         self._pads: dict[str, PadBackend] = {}
+        self._wanted: set[str] = set()  # the controllers that are there: READY, or sending input
         self._creating: dict[str, asyncio.Task[None]] = {}
         self._closing: set[asyncio.Task[None]] = set()  # pads being closed in a worker thread
         self._pending: dict[str, deque[GamepadState]] = {}
@@ -282,15 +281,13 @@ class VirtualGamepads:
             if sys.platform != "darwin":
                 raise SetupError("--gamepad ojd is macOS only: it uses the signed OpenJoystickDriver app")
             executable = find_ojd(cfg.ojd_path)
-            return cls(
-                cfg, log, rx, lambda label: OJDPad(label, executable, cfg.gamepad_profile), kind="ojd", per_boot=True
-            )
+            return cls(cfg, log, rx, lambda label: OJDPad(label, executable, cfg.gamepad_profile), kind="ojd")
         if cfg.gamepad == "uinput":
             check_available()  # the wrong system, no uinput, or no right to open it: said at start
-            return cls(cfg, log, rx, UinputPad, kind="uinput", per_boot=True)
+            return cls(cfg, log, rx, UinputPad, kind="uinput")
         if cfg.gamepad == "uhid":
             check_uhid_available()  # the same for uhid
-            return cls(cfg, log, rx, UhidPad, kind="uhid", per_boot=True)
+            return cls(cfg, log, rx, UhidPad, kind="uhid")
         if cfg.gamepad != "vigem":
             raise ValueError(f"unknown --gamepad {cfg.gamepad!r}; use off, vigem, ojd, uinput or uhid")
         if sys.platform != "win32":
@@ -304,9 +301,25 @@ class VirtualGamepads:
                 f"--gamepad vigem needs the ViGEmBus driver installed (vgamepad said: {e}); "
                 "get it from https://github.com/nefarius/ViGEmBus/releases"
             ) from e
-        return cls(cfg, log, rx, ViGEmPad, per_boot=True)
+        return cls(cfg, log, rx, ViGEmPad)
 
     # ---- input -----------------------------------------------------------------------
+    def prepare(self, label: str) -> None:
+        """The controller's link is READY: make its pad now. A game then finds a controller that
+        is switched on, and the first press does not wait for a pad that takes seconds to make."""
+        if self._closed or not label:
+            return
+        self._wanted.add(label)
+        self._start(label)
+
+    def _start(self, label: str) -> None:
+        """Begin making the pad of ``label``, unless it has one, is getting one or was refused one."""
+        if label in self._pads or label in self._creating or label in self._failed:
+            return
+        self._creating[label] = asyncio.get_running_loop().create_task(
+            self._create(label, self._generation.get(label, 0))
+        )
+
     def on_event(self, ev: dict[str, Any]) -> None:
         """One decoded input event from the receiver: apply it to that controller's pad.
 
@@ -330,10 +343,8 @@ class VirtualGamepads:
                 # state stands for all of it, which lets go of whatever was pressed on the way.
                 pending.clear()
                 pending.append(state)
-            if label not in self._creating:
-                self._creating[label] = asyncio.get_running_loop().create_task(
-                    self._create(label, self._generation.get(label, 0))
-                )
+            self._wanted.add(label)  # input from a controller that was never seen READY
+            self._start(label)
             return
         self._apply(label, pad, state)
 
@@ -370,8 +381,8 @@ class VirtualGamepads:
         """Build the pad for ``label`` in a worker thread, then keep it or let it go.
 
         ``generation`` is the label's count of releases when the pad was asked for. A pad that
-        lives for one boot and is ready only after its controller went away is nobody's: it is
-        closed, and built again when the controller is back and its input waits."""
+        is ready only after its controller went away is nobody's: it is closed, and built again
+        when the controller is back by then."""
         if after is not None:  # the pad this one replaces is still being closed
             await asyncio.wait([after])
         if self._closed:
@@ -396,10 +407,10 @@ class VirtualGamepads:
             error = e
         finally:
             self._creating.pop(label, None)
-        stale = self._per_boot and generation != self._generation.get(label, 0)
+        stale = generation != self._generation.get(label, 0)
         if self._closed or stale:
             closing = self._close_pad(label, pad) if pad is not None else None
-            if not self._closed and label in self._pending and label not in self._failed:
+            if not self._closed and label in self._wanted and label not in self._failed:
                 again = self._create(label, self._generation.get(label, 0), closing)
                 self._creating[label] = asyncio.create_task(again)
             return
@@ -452,22 +463,16 @@ class VirtualGamepads:
 
     # ---- lifecycle -------------------------------------------------------------------
     def release(self, label: str) -> None:
-        """Let go of every button and stick: the controller rebooted or went away.
+        """Remove the controller's pad: it rebooted or went away.
 
-        A pad that could not be created is forgotten too, so the controller's next report tries
-        again: rebooting the controller is how a user retries a pad ViGEm refused.
+        A pad that could not be created is forgotten too, so the controller's next boot tries
+        again: rebooting the controller is how a user retries a pad that was refused.
         """
         self._generation[label] = self._generation.get(label, 0) + 1
-        pad = self._pads.get(label)
+        self._wanted.discard(label)
+        pad = self._pads.pop(label, None)
         if pad is not None:
-            if self._per_boot:
-                self._pads.pop(label)
-                self._close_pad(label, pad)  # close the feed and release OJD's limited slots
-            else:
-                try:
-                    pad.reset()
-                except Exception as e:  # a pad its driver has dropped: the next report gets a new one
-                    self._backend_failed(label, pad, _wording(e))
+            self._close_pad(label, pad)
         self._pending.pop(label, None)
         self._failed.pop(label, None)
 
@@ -479,6 +484,7 @@ class VirtualGamepads:
         for label, pad in list(self._pads.items()):
             self._close_pad(label, pad)
         self._pads.clear()
+        self._wanted.clear()
         self._pending.clear()
 
     async def wait_closed(self) -> None:

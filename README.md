@@ -271,8 +271,10 @@ installer.
 Every report reaches the pad as XInput fields with the standard stick deadzones
 (`--gamepad-deadzone off` for raw sticks); the Stadia button is the guide button, Assistant
 and Capture have no XInput equivalent. The game's rumble comes back to the controller through
-the game session, which `--gamepad` starts for that reason. Two controllers are players 1 and
-2, and `/_status` lists the pads under `gamepads`.
+the game session, which `--gamepad` starts for that reason. A pad is plugged in when its
+controller connects and unplugged when the controller is switched off, as a wireless pad is.
+Two controllers are players 1 and 2, a controller that comes back takes the lowest player
+that is free, and `/_status` lists the pads under `gamepads`.
 
 ## Virtual gamepad (macOS)
 
@@ -324,8 +326,8 @@ stadiacast --preset live --dns-upstream 192.168.1.1 --gamepad uinput
 
 The pad has the buttons, the axes and the name the kernel gives a real one, and SDL, which
 Steam and most Linux games read gamepads through, takes it for an Xbox 360 controller. It
-appears with the controller's first input and is unplugged when the controller is switched
-off, as a wireless pad is.
+appears when the controller connects and is unplugged when the controller is switched off, as
+a wireless pad is.
 
 Creating a pad means opening `/dev/uinput`, which on most systems only root may do. A receiver
 that runs as root can. For one that does not, a udev rule gives the device to whoever sits at

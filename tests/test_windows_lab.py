@@ -1,7 +1,8 @@
-"""The Windows-only paths against the real drivers: the ViGEm pad read back through XInput, the game's
-rumble through ViGEm's notification, the WASAPI loopback capture, and the controller's microphone played
-into a virtual cable and recorded from its other side. Runs on a Windows machine with the ViGEmBus
-driver, when STADIACAST_WINDOWS_LAB is set (the Windows lab workflow); skipped elsewhere."""
+"""The Windows-only paths against the real drivers: the ViGEm pad read back through XInput, plugged in
+and unplugged with its controller, the game's rumble through ViGEm's notification, the WASAPI loopback
+capture, and the controller's microphone played into a virtual cable and recorded from its other side.
+Runs on a Windows machine with the ViGEmBus driver, when STADIACAST_WINDOWS_LAB is set (the Windows lab
+workflow); skipped elsewhere."""
 
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ import pytest
 
 from stadiacast.audio import ffmpeg_path
 from stadiacast.errors import SetupError
-from tests.helpers import connect_firmware_flow, make_receiver, single, wait_for
+from tests.helpers import connect_firmware_flow, fake, make_receiver, single, wait_for
 from tests.test_micdevice import loud, say
 from tests.test_microphone import real_opus
 
@@ -62,12 +63,21 @@ def _read(lib, slot: int) -> _XInputGamepad:
     return state.Gamepad
 
 
-def test_a_real_vigem_pad_follows_the_controller_and_reports_the_rumble(tmp_path) -> None:
+def _players(lib) -> set[int]:
+    """The XInput players that have a pad right now."""
+    return {slot for slot in range(4) if lib.XInputGetState(slot, ctypes.byref(_XInputState())) == 0}
+
+
+def _needs_the_xbox_360_driver() -> None:
     if not os.path.exists(r"C:\Windows\INF\xusb22.inf"):
         # A ViGEm pad is a virtual Xbox 360 controller and binds to Windows' inbox driver for it.
         # Windows Server (the hosted runners) ships without that driver: the pad enumerates but never
         # plugs in (TARGET_NOT_PLUGGED_IN), on any software. Desktop Windows 10 and 11 have it.
         pytest.skip("no Xbox 360 controller driver (xusb22.inf): this Windows cannot host a ViGEm pad")
+
+
+def test_a_real_vigem_pad_follows_the_controller_and_reports_the_rumble(tmp_path) -> None:
+    _needs_the_xbox_360_driver()
 
     async def run() -> None:
         rx = make_receiver(tmp_path, gamepad="vigem", start_game="auto", start_game_delay=0.05)
@@ -106,6 +116,60 @@ def test_a_real_vigem_pad_follows_the_controller_and_reports_the_rumble(tmp_path
         finally:
             fc.close()
             await rx.stop()
+
+    asyncio.run(run())
+
+
+def test_real_vigem_pads_are_plugged_in_and_unplugged_with_their_controllers(tmp_path) -> None:
+    """Two controllers that connect at the same moment each get an Xbox pad with a player of its
+    own, before either has sent any input. The one that is switched off takes its pad out of
+    XInput, and takes the lowest free player when it comes back."""
+    _needs_the_xbox_360_driver()
+
+    async def connect(fc: Any) -> None:
+        await fc.boot()
+        await fc.start_udp()
+        await fc.discover()
+        await fc.poll_gmsg()
+        await fc.poll_gmsg()
+        fc.connect()
+        await fc.wait_connected(10)
+        await asyncio.wait_for(fc.display_ready.wait(), 5)
+        await fc.keepalive()
+
+    async def run() -> None:
+        lib = _xinput()
+        before = _players(lib)
+        rx = make_receiver(tmp_path, gamepad="vigem", display_rpc_delay=0.05, display_rpc_interval=0.1)
+        await rx.start()
+        fa, fb = fake(rx, "fake-a"), fake(rx, "fake-b")
+
+        def slots() -> dict[str, int | None]:
+            return {label: pad.get("slot") for label, pad in rx.status()["gamepads"].items()}
+
+        try:
+            await asyncio.gather(connect(fa), connect(fb))
+            a, b = rx.find("fake-a"), rx.find("fake-b")
+            assert a is not None and b is not None
+            await wait_for(lambda: len(slots()) == 2 and None not in slots().values(), timeout=40)
+            first = slots()
+            assert len(set(first.values())) == 2, f"two pads, one player: {first}"
+            assert _players(lib) - before == set(first.values())
+
+            fa.power_off()
+            await wait_for(lambda: slots().keys() == {b.label}, timeout=10)
+            await wait_for(lambda: _players(lib) - before == {first[b.label]}, timeout=10)
+
+            fa = fake(rx, "fake-a")
+            await connect(fa)
+            await wait_for(lambda: slots().get(a.label) is not None, timeout=40)
+            assert slots() == first  # the lowest free player is the one it had
+            assert _players(lib) - before == set(first.values())
+        finally:
+            fa.close()
+            fb.close()
+            await rx.stop()
+        await wait_for(lambda: _players(lib) == before, timeout=10)
 
     asyncio.run(run())
 

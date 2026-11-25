@@ -141,10 +141,12 @@ and `ctl.emit_input_event`.
 
 **`VirtualGamepads`** (`--gamepad`) belongs to the `Receiver`, which hands it every input event
 it publishes (`publish_event`), from the display link and the game session alike
-(`GamepadState.from_event` reads both shapes). It creates one pad per controller label in a
-worker thread, forwards the motor levels a game sets to that controller's `GameSession`, and
-lets go of the pad's state when the controller reboots, which is also when a pad that could not
-be created is tried again.
+(`GamepadState.from_event` reads both shapes). A pad lives for one boot of its controller: it
+is created in a worker thread when the display link is READY, so that it is there before the
+first press (a ViGEm pad takes about three seconds to make), and closed when the controller
+reboots or goes away, which is also when a pad that could not be created is tried again. Input
+that arrives while a pad is being made is kept and played into it. The motor levels a game
+sets go to that controller's `GameSession`.
 
 The macOS pad (`ojd_gamepad.py`, `--gamepad ojd`) is a process: `ojd virtual feed`, the command
 line of the OpenJoystickDriver app, which holds the entitlement a virtual HID device needs. Each

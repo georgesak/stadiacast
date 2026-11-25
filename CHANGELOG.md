@@ -7,7 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
-- On Windows, ViGEm gamepads are now removed upon controller disconnect when using the `--gamepad vigem` argument. https://github.com/jkfran/stadiacast/issues/13
+- On Windows, a controller that is switched off takes its virtual pad with it, as on Linux and
+  macOS: the Xbox pad of `--gamepad vigem` stayed plugged in until the receiver stopped, so
+  games and Steam counted controllers that were off. A controller that comes back takes the
+  lowest XInput player that is free.
+- A controller's virtual pad is there as soon as the controller has connected, on every
+  system, instead of from its first input: a game finds a controller that is switched on, and
+  the first press does not wait for the pad, which takes about three seconds to make on
+  Windows.
 
 ### Fixed
 - On Windows, two controllers that connect at the same moment are no longer both listed as
