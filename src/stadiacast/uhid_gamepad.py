@@ -469,6 +469,11 @@ class UhidPad:
             raise SetupError(f"the kernel refused the virtual pad: {e}") from e
         self._starts = self._requests.starts
         self.device = self._find_node()
+        # A pad is made when its controller connects, before any input: it says from the start
+        # that it is at rest. An event device that has had no report reads its sticks as held in
+        # a corner, and SDL's Stadia driver the D-pad as held up.
+        self._report = input_report(GamepadState())
+        self._write_again()
         self._thread = threading.Thread(target=self._feedback_loop, name=f"uhid-{label}", daemon=True)
         self._thread.start()
 
@@ -514,9 +519,8 @@ class UhidPad:
 
     def _write_again(self) -> None:
         with self._report_lock:
-            if self._report:  # a pad that was given no state has none to repeat
-                with contextlib.suppress(OSError):
-                    os.write(self._fd, input2_event(self._report))
+            with contextlib.suppress(OSError):
+                os.write(self._fd, input2_event(self._report))
             self._written = time.monotonic()
 
     def apply(self, xinput: dict[str, int]) -> None:

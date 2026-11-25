@@ -112,6 +112,35 @@ def test_the_kernel_takes_the_pad_for_a_stadia_controller(pad: UhidPad) -> None:
         game.close()
 
 
+def test_a_pad_that_was_given_no_input_is_at_rest(pad: UhidPad) -> None:
+    """A pad exists from the moment its controller connects. Before the first input its sticks
+    are in the middle on the event device, which knows no value until a report comes, and a
+    program that opens the hidraw node is told the same, as SDL 3 needs it."""
+    assert pad.device is not None
+    game = Game(_event_node(pad.device))
+    try:
+        wait_until(lambda: game.axis(ABS_X)[0] == 128)
+        assert [game.axis(axis)[0] for axis in (ABS_X, ABS_Y, ABS_Z, ABS_RZ, ABS_GAS, ABS_BRAKE)] == [128] * 4 + [0, 0]
+        assert (game.axis(ABS_HAT0X)[0], game.axis(ABS_HAT0Y)[0]) == (0, 0) and not game.held() & set(KEYS)
+    finally:
+        game.close()
+    raw = _open_hidraw(pad.device)
+    try:
+        seen: list[bytes] = []
+
+        def told() -> bool:
+            try:
+                seen.append(os.read(raw, 64))
+            except BlockingIOError:
+                return False
+            return True
+
+        wait_until(told)
+        assert seen[0] == input_report(GamepadState())
+    finally:
+        os.close(raw)
+
+
 def test_every_control_is_the_key_and_the_axis_of_the_wired_controller(pad: UhidPad) -> None:
     """Each button alone, then the D-pad, the sticks and the triggers: the event device says what
     a wired Stadia Controller's says for the same control."""

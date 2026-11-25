@@ -450,17 +450,29 @@ def _create_pad(kernel: socket.socket) -> uhid.UhidPad:
     return pad
 
 
-def _reports(kernel: socket.socket, wanted: int, within: float = 3.0) -> list[bytes]:
-    """The next ``wanted`` different input reports the pad writes; one written again counts once."""
-    seen: list[bytes] = []
+REST = input_report(GamepadState())
+
+
+def _reports(kernel: socket.socket, wanted: int, within: float = 3.0, after: bytes | None = None) -> list[bytes]:
+    """The next ``wanted`` different input reports the pad writes; one written again counts once,
+    and so does ``after``, the report it was writing before."""
+    seen: list[bytes] = [] if after is None else [after]
     deadline = time.monotonic() + within
-    while len(seen) < wanted:
+    while len(seen) < wanted + (after is not None):
         kernel.settimeout(max(0.01, deadline - time.monotonic()))
         event = kernel.recv(EVENT_SIZE * 2)
         assert struct.unpack_from("=IH", event) == (UHID_INPUT2, 10)
         if not seen or event[6:16] != seen[-1]:
             seen.append(event[6:16])
-    return seen
+    return seen if after is None else seen[1:]
+
+
+def _answer(kernel: socket.socket) -> bytes:
+    """The pad's next event that is not an input report: it writes its state all the while."""
+    while True:
+        event = kernel.recv(EVENT_SIZE * 2)
+        if struct.unpack_from("=I", event) != (UHID_INPUT2,):
+            return event
 
 
 linux_only = pytest.mark.skipif(
@@ -475,12 +487,12 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
     INPUT2 events, and closing the file is the end of it."""
     pad = _create_pad(kernel)
     assert pad.device == "/dev/hidraw9"
+    assert _reports(kernel, 1) == [REST]  # at rest from its start, before any input
 
     levels: list[tuple[int, int]] = []
     pad.on_rumble(lambda strong, weak: levels.append((strong, weak)))
     kernel.send(_set_report(7, b"\x05\x00\x80\x00\x40"))
-    reply = kernel.recv(EVENT_SIZE * 2)
-    assert _reply(reply) == (UHID_SET_REPORT_REPLY, 7, 0)
+    assert _reply(_answer(kernel)) == (UHID_SET_REPORT_REPLY, 7, 0)
     wait_until(lambda: levels == [(0x80, 0x40)])  # one level at a time: the pad hands on the newest
     kernel.send(_output(b"\x05\x00\x00\x00\x00"))
     wait_until(lambda: levels == [(0x80, 0x40), (0, 0)])
@@ -488,10 +500,7 @@ def test_the_pad_waits_for_its_start_answers_on_its_thread_and_reports(kernel):
     pad.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))
     pad.apply_state(GamepadState(buttons=int(Button.ASSISTANT)))  # nothing changed: nothing written
     pad.reset()
-    assert _reports(kernel, 2) == [
-        input_report(GamepadState(buttons=int(Button.ASSISTANT))),
-        input_report(GamepadState()),
-    ]
+    assert _reports(kernel, 2, after=REST) == [input_report(GamepadState(buttons=int(Button.ASSISTANT))), REST]
 
     pad.close()
     pad.close()  # once is enough
@@ -505,7 +514,7 @@ def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_
     """The kernel drops the input written while a HID driver takes the device, a new driver's
     event device knows no report, and a program that opens the hidraw node has seen none: the
     pad repeats its state at a steady pace, so each has it a moment later. A change is written
-    at once all the same, and a pad that was given no state writes nothing."""
+    at once all the same, and a pad that was given no state says it is at rest."""
     monkeypatch.setattr(uhid.UhidPad, "REFRESH", 0.02)
     pad = _create_pad(kernel)
 
@@ -532,7 +541,7 @@ def test_the_state_is_written_again_while_nothing_changes_and_a_new_start_names_
             seen += written(0.5)
         assert set(seen) == {report}
 
-    assert written(0.3) == []  # no state yet: nothing to repeat
+    repeats(REST, 3)  # no input yet: at rest, as its controller is
     held = input_report(GamepadState(buttons=int(Button.A), lx=32767))
     pad.apply_state(GamepadState(buttons=int(Button.A), lx=32767))
     repeats(held, 5)
@@ -568,7 +577,7 @@ def test_a_pad_without_a_hidraw_node_names_none_and_one_the_kernel_dropped_says_
     pad = _create_pad(kernel)
     assert pad.device is None
     pad.apply_state(GamepadState(buttons=int(Button.A)))
-    assert _reports(kernel, 1) == [input_report(GamepadState(buttons=int(Button.A)))]
+    assert _reports(kernel, 1, after=REST) == [input_report(GamepadState(buttons=int(Button.A)))]
     kernel.close()  # the device is gone under the pad
 
     def press() -> None:
